@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Big Brother",
+  "version": "1.0.0",
+  "description": "An AI Agent interface for inspecting and interacting with webpages",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "src/background/background.ts",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Open Big Brother"
+  },
+  "side_panel": {
+    "default_path": "index.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content/content.ts"],
+      "run_at": "document_idle"
+    }
+  ]
+}
