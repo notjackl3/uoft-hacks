@@ -9,6 +9,7 @@ from app.utils.helpers import extract_json_object
 
 
 def _call_openai_sync(prompt: str) -> str:
+    """Synchronous OpenAI call for step selection."""
     from openai import OpenAI  # type: ignore
 
     client = OpenAI(api_key=settings.openai_api_key)

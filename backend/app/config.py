@@ -26,7 +26,7 @@ if BaseSettings is not None:
     class Settings(BaseSettings):
         mongodb_uri: str
         mongodb_db_name: str
-        openai_api_key: str  # Changed from gemini_api_key
+        openai_api_key: str  # OpenAI API key for LLM calls
         voyage_api_key: str
         environment: str = "development"
         log_level: str = "INFO"
@@ -45,7 +45,7 @@ else:
         def __init__(self) -> None:
             self.mongodb_uri = os.getenv("MONGODB_URI", "")
             self.mongodb_db_name = os.getenv("MONGODB_DB_NAME", "tutor_agent")
-            self.openai_api_key = os.getenv("OPENAI_API_KEY", "")  # Changed from GEMINI_API_KEY
+            self.openai_api_key = os.getenv("OPENAI_API_KEY", "")  # OpenAI API key
             self.voyage_api_key = os.getenv("VOYAGE_API_KEY", "")
             self.environment = os.getenv("ENVIRONMENT", "development")
             self.log_level = os.getenv("LOG_LEVEL", "INFO")

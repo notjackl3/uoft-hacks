@@ -250,16 +250,14 @@ def _call_openai_matcher_sync(prompt: str) -> str:
 
     client = OpenAI(api_key=settings.openai_api_key)
     response = client.chat.completions.create(
-        model="gpt-4o-mini",  # Fast and cheap model
-        messages=[
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.3,  # Lower temperature for more deterministic matching
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
     )
     return response.choices[0].message.content or ""
 
 
-async def fallback_to_openai(current_step: PlannedStep, page_features: List[PageFeature]) -> Dict:
+async def fallback_to_gemini(current_step: PlannedStep, page_features: List[PageFeature]) -> Dict:
     """
     When algorithmic matching fails, ask OpenAI to choose the best feature index.
     Returns same format as match_element_to_step.
@@ -316,7 +314,3 @@ Reply JSON: {{"index":N,"confidence":0.9}} or {{"index":null,"confidence":0}}"""
     except Exception as e:  # pragma: no cover
         logger.exception("OpenAI fallback matcher failed")
         raise MatcherError(str(e)) from e
-
-
-# Alias for backwards compatibility
-fallback_to_gemini = fallback_to_openai
