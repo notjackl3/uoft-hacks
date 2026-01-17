@@ -1,0 +1,187 @@
+// Content Script - Injected into every page
+console.log('Big Brother: Content script loaded on', window.location.href);
+
+// Listen for messages from the side panel (via background script)
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  console.log('Content script received message:', message);
+
+  if (message.type === 'USER_PROMPT') {
+    handleUserPrompt(message.payload.prompt)
+      .then((result) => {
+        sendResponse({ success: true, ...result });
+      })
+      .catch((error) => {
+        console.error('Error handling user prompt:', error);
+        sendResponse({ success: false, error: error.message });
+      });
+
+    // Return true to indicate we'll send response asynchronously
+    return true;
+  }
+
+  return false;
+});
+
+/**
+ * Handle user prompts and interact with the DOM
+ */
+async function handleUserPrompt(prompt: string): Promise<{ message: string; domSnapshot?: string }> {
+  console.log('Processing prompt:', prompt);
+
+  // Example: Log the DOM body to prove we have access
+  const bodyText = document.body.innerText.substring(0, 500); // First 500 chars
+  const pageTitle = document.title;
+  const pageUrl = window.location.href;
+
+  console.log('Current page title:', pageTitle);
+  console.log('Current page URL:', pageUrl);
+  console.log('Body text preview:', bodyText);
+
+  // Get DOM statistics
+  const domStats = {
+    totalElements: document.querySelectorAll('*').length,
+    links: document.querySelectorAll('a').length,
+    images: document.querySelectorAll('img').length,
+    buttons: document.querySelectorAll('button').length,
+    inputs: document.querySelectorAll('input').length,
+  };
+
+  console.log('DOM Statistics:', domStats);
+
+  // Get first 10 links
+  const allLinks = Array.from(document.querySelectorAll('a'));
+  const first10Links = allLinks.slice(0, 50);
+  
+  console.log('First 50 links:');
+  const linksInfo = first10Links.map((link, index) => {
+    const href = link.getAttribute('href') || 'No href';
+    const text = link.innerText.trim() || link.textContent?.trim() || 'No text';
+    console.log(`${index + 1}. [${text.substring(0, 50)}] -> ${href}`);
+    return { index: index + 1, text: text.substring(0, 50), href };
+  });
+
+  // Highlight a random link from the first 10 (instead of clicking)
+  let clickedLink = null;
+  if (first10Links.length > 0) {
+    const randomIndex = Math.floor(Math.random() * first10Links.length);
+    const randomLink = first10Links[randomIndex] as HTMLElement;
+    clickedLink = {
+      index: randomIndex + 1,
+      text: randomLink.innerText.trim() || randomLink.textContent?.trim() || 'No text',
+      href: randomLink.getAttribute('href') || 'No href'
+    };
+    
+    console.log(`Highlighting random link #${clickedLink.index}: ${clickedLink.text}`);
+    
+    // Get current background color and calculate complement
+    const computedStyle = window.getComputedStyle(randomLink);
+    const bgColor = computedStyle.backgroundColor;
+    
+    // Parse RGB and calculate complementary color
+    let highlightColor = '#FF00FF'; // Default hot pink
+    const rgbMatch = bgColor.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+    if (rgbMatch) {
+      const r = parseInt(rgbMatch[1]);
+      const g = parseInt(rgbMatch[2]);
+      const b = parseInt(rgbMatch[3]);
+      // Calculate complementary color (invert)
+      const compR = 255 - r;
+      const compG = 255 - g;
+      const compB = 255 - b;
+      highlightColor = `rgb(${compR}, ${compG}, ${compB})`;
+    }
+    
+    // Apply dramatic highlight styling
+    randomLink.style.backgroundColor = highlightColor;
+    randomLink.style.color = rgbMatch && (parseInt(rgbMatch[1]) > 128) ? '#000000' : '#FFFFFF';
+    randomLink.style.border = '3px solid #FF0000';
+    randomLink.style.padding = '8px';
+    randomLink.style.fontWeight = 'bold';
+    randomLink.style.boxShadow = '0 0 20px rgba(255, 0, 0, 0.8)';
+    randomLink.style.transform = 'scale(1.1)';
+    randomLink.style.transition = 'all 0.3s ease';
+    randomLink.style.zIndex = '9999';
+    randomLink.style.position = 'relative';
+  }
+
+  // Build response message with links
+  let linksMessage = '\n\n**First 10 Links Found:**\n';
+  linksInfo.forEach(link => {
+    linksMessage += `${link.index}. ${link.text} → ${link.href}\n`;
+  });
+
+  const clickMessage = clickedLink 
+    ? `\n\n**� Highlighted Random Link #${clickedLink.index}:** ${clickedLink.text}`
+    : '\n\n⚠️ No links found to highlight';
+
+  const message = `
+📄 **Page Inspected**: ${pageTitle}
+🔗 **URL**: ${pageUrl}
+
+**DOM Statistics**:
+- Total Elements: ${domStats.totalElements}
+- Links: ${domStats.links}
+- Images: ${domStats.images}
+- Buttons: ${domStats.buttons}
+- Input Fields: ${domStats.inputs}
+${linksMessage}${clickMessage}
+
+**Your Prompt**: "${prompt}"
+  `.trim();
+
+  return {
+    message,
+    domSnapshot: bodyText,
+  };
+}
+
+/**
+ * Helper function to query DOM elements
+ */
+function queryDOMElements(selector: string): Element[] {
+  try {
+    return Array.from(document.querySelectorAll(selector));
+  } catch (error) {
+    console.error('Error querying DOM:', error);
+    return [];
+  }
+}
+
+/**
+ * Helper function to click an element
+ */
+function clickElement(selector: string): boolean {
+  try {
+    const element = document.querySelector(selector) as HTMLElement;
+    if (element) {
+      element.click();
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.error('Error clicking element:', error);
+    return false;
+  }
+}
+
+/**
+ * Helper function to fill an input field
+ */
+function fillInput(selector: string, value: string): boolean {
+  try {
+    const element = document.querySelector(selector) as HTMLInputElement;
+    if (element) {
+      element.value = value;
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.error('Error filling input:', error);
+    return false;
+  }
+}
+
+// Export helper functions for potential future use
+export { queryDOMElements, clickElement, fillInput };

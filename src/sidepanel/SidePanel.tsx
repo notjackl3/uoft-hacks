@@ -156,7 +156,7 @@ const SidePanel: React.FC = () => {
                     : 'bg-white text-gray-800 border border-gray-200'
                 }`}
               >
-                <p className="text-sm whitespace-pre-wrap">{message.content}</p>
+                <p className="text-sm whitespace-pre-wrap break-words overflow-wrap-anywhere">{message.content}</p>
                 <p
                   className={`text-xs mt-1 ${
                     message.role === 'user' ? 'text-blue-200' : 'text-gray-400'
