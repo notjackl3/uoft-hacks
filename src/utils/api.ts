@@ -57,6 +57,7 @@ export interface NextActionRequest {
   page_features: PageFeature[];
   url?: string;
   page_title?: string;
+  force_advance?: boolean;
   previous_action_result?: {
     success: boolean;
     error?: string;

@@ -38,7 +38,7 @@ def build_step_selector_prompt(
             "selector": f.selector or "",
             "value_len": int(getattr(f, "value_len", 0) or 0),
         }
-        for f in (page_features or [])[:30]
+        for f in (page_features or [])[:60]
     ]
     recent = [
         {

@@ -30,6 +30,8 @@ const SidePanel: React.FC = () => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const manualAdvanceRef = useRef<boolean>(false);
   const manualAdvanceNoteRef = useRef<string>('');
+  const forceAdvanceRef = useRef<boolean>(false);
+  const executionRunIdRef = useRef<number>(0);
   const [speechOutputEnabled, setSpeechOutputEnabled] = useState(false);
   const [showMicInstructions, setShowMicInstructions] = useState(false);
   const [isListening, setIsListening] = useState(false);
@@ -462,6 +464,8 @@ const SidePanel: React.FC = () => {
       return;
     }
 
+    // Cancellation token: any Clear/new execution increments executionRunIdRef.
+    const myRunId = ++executionRunIdRef.current;
     const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
     const consumeManualAdvance = (): { advanced: boolean; note?: string } => {
       if (!manualAdvanceRef.current) return { advanced: false };
@@ -469,6 +473,11 @@ const SidePanel: React.FC = () => {
       const note = manualAdvanceNoteRef.current;
       manualAdvanceNoteRef.current = '';
       return { advanced: true, note };
+    };
+    const consumeForceAdvance = (): boolean => {
+      if (!forceAdvanceRef.current) return false;
+      forceAdvanceRef.current = false;
+      return true;
     };
 
     const getFeaturesSafe = async (): Promise<ContentResponse> => {
@@ -555,6 +564,20 @@ const SidePanel: React.FC = () => {
     let previousSuccess = false;
     let previousError: string | undefined = undefined;
 
+    const keywordsFromInstruction = (s: string): string[] => {
+      const stop = new Set([
+        'click','press','tap','select','open','choose','button','link','menu','field','input','text','type','enter',
+        'the','a','an','to','on','in','of','and','for','with','from','this','that','then','next','page','result','results',
+      ]);
+      return (s || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .split(/\s+/)
+        .map((t) => t.trim())
+        .filter((t) => t.length >= 2 && !stop.has(t))
+        .slice(0, 8);
+    };
+
     try {
       const waitForManualPageChange = async (opts: {
         prevUrl: string;
@@ -586,11 +609,14 @@ const SidePanel: React.FC = () => {
 
       // Drive execution off the backend `/next` so step order stays in sync.
       for (let guard = 0; guard < 200; guard++) {
-        // Get current page features (fresh DOM)
-        const featuresResponse: ContentResponse = await getFeaturesSafe();
+        if (myRunId !== executionRunIdRef.current) return;
+        // Get current page features (fresh DOM).
+        // First pass: broad scan to ask backend for next step/instruction.
+        let featuresResponse: ContentResponse = await getFeaturesSafe();
         if (!featuresResponse.features) {
           throw new Error(featuresResponse.error || 'Failed to get page features');
         }
+        if (myRunId !== executionRunIdRef.current) return;
 
         // Debug: log what the extension sees from the page (open the Side Panel DevTools console)
         try {
@@ -617,8 +643,9 @@ const SidePanel: React.FC = () => {
         const prevUrl = featuresResponse.pageUrl || window.location.href;
         const prevSig = featuresSignature(featuresResponse.features as PageFeature[]);
 
-        // Manual override: if user pressed "Next step", treat previous step as complete.
+        // Manual override: if user pressed "Next step", force the backend to advance no matter what.
         const manualBeforeNext = consumeManualAdvance();
+        const forceAdvance = consumeForceAdvance() || manualBeforeNext.advanced;
         if (manualBeforeNext.advanced) {
           previousSuccess = true;
           previousError = manualBeforeNext.note || 'Manual advance';
@@ -630,13 +657,47 @@ const SidePanel: React.FC = () => {
           page_features: featuresResponse.features as PageFeature[],
           url: featuresResponse.pageUrl || window.location.href,
           page_title: featuresResponse.pageTitle || document.title,
+          force_advance: forceAdvance,
           previous_action_result: { success: previousSuccess, error: previousError },
         });
+        if (myRunId !== executionRunIdRef.current) return;
 
         const stepIndex = Math.max(0, (nextAction.step_number || 1) - 1);
         const step = steps[stepIndex];
         const action = nextAction.action as 'CLICK' | 'TYPE' | 'SCROLL' | 'WAIT' | 'DONE';
         const instruction = nextAction.instruction || step?.description || '';
+        // For CLICK/TYPE steps, rescan with filtering + keyword ranking to improve target selection.
+        if (action === 'CLICK' || action === 'TYPE') {
+          const types =
+            action === 'TYPE'
+              ? (['input'] as const)
+              : (['button', 'link'] as const);
+          const keywords = keywordsFromInstruction(instruction);
+          try {
+            featuresResponse = await sendMessageToContent({
+              type: 'GET_FEATURES',
+              payload: { types: types as any, keywords, limit: 150 },
+              target: 'content',
+            });
+            if (featuresResponse.success && featuresResponse.features?.length) {
+              // Re-ask backend for match using focused features to avoid irrelevant picks like "Home".
+              const nextActionFocused = await getNextAction({
+                session_id: currentSession.sessionId,
+                page_features: featuresResponse.features as PageFeature[],
+                url: featuresResponse.pageUrl || window.location.href,
+                page_title: featuresResponse.pageTitle || document.title,
+                force_advance: forceAdvance,
+                previous_action_result: { success: false, error: 'Focused re-match' },
+              });
+              // Only replace if it actually found a target.
+              if (nextActionFocused.target_feature_index !== null) {
+                Object.assign(nextAction, nextActionFocused);
+              }
+            }
+          } catch {
+            // ignore and proceed with original nextAction
+          }
+        }
         const textInput = step?.text_input ?? nextAction.text_input;
         const expectChange = Boolean(nextAction.expected_page_change);
 
@@ -669,6 +730,7 @@ const SidePanel: React.FC = () => {
           addAgentMessage('Please scroll down a bit on the page.');
           let detected = false;
           for (let i = 0; i < 12; i++) {
+            if (myRunId !== executionRunIdRef.current) return;
             const manual = consumeManualAdvance();
             if (manual.advanced) {
               detected = true;
@@ -677,8 +739,8 @@ const SidePanel: React.FC = () => {
             const waited = await sendMessageToContent({
               type: 'WAIT_FOR_EVENT',
               payload: { event: 'scroll', timeoutMs: 2500 },
-              target: 'content',
-            });
+            target: 'content',
+          });
             if (waited.success) {
               detected = true;
               break;
@@ -712,6 +774,7 @@ const SidePanel: React.FC = () => {
               timeoutMs: 60000,
               remindEveryMs: 15000,
             });
+            if (myRunId !== executionRunIdRef.current) return;
             if (!changed) {
               addAgentMessage(
                 '⚠️ I still didn’t detect the page changing. Please do the step above. If you went to the wrong site, go back and open:\nhttps://www.instagram.com/accounts/emailsignup/'
@@ -724,6 +787,7 @@ const SidePanel: React.FC = () => {
           } else {
             // Short wait, but still allow manual override.
             for (let i = 0; i < 2; i++) {
+              if (myRunId !== executionRunIdRef.current) return;
               const manual = consumeManualAdvance();
               if (manual.advanced) break;
               await delay(1000);
@@ -763,9 +827,11 @@ const SidePanel: React.FC = () => {
           },
           target: 'content',
         });
+        if (myRunId !== executionRunIdRef.current) return;
 
         // Wait a moment for user to see the highlight
         await delay(1200);
+        if (myRunId !== executionRunIdRef.current) return;
 
         // Guidance-only: user performs the action. We just wait for the event.
         if (action === 'CLICK') {
@@ -773,6 +839,7 @@ const SidePanel: React.FC = () => {
           let detected = false;
           let manualUsedThisStep = false;
           for (let i = 0; i < 12; i++) {
+            if (myRunId !== executionRunIdRef.current) return;
             const manual = consumeManualAdvance();
             if (manual.advanced) {
               detected = true;
@@ -781,14 +848,14 @@ const SidePanel: React.FC = () => {
             }
             const waited = await sendMessageToContent({
               type: 'WAIT_FOR_EVENT',
-              payload: {
+          payload: {
                 event: 'click',
-                targetIndex: nextAction.target_feature_index,
+            targetIndex: nextAction.target_feature_index,
                 selector: nextAction.target_feature?.selector,
                 timeoutMs: 2500,
-              },
-              target: 'content',
-            });
+          },
+          target: 'content',
+        });
             if (waited.success) {
               detected = true;
               break;
@@ -796,7 +863,7 @@ const SidePanel: React.FC = () => {
           }
           if (!detected) {
             addAgentMessage(`⚠️ I didn't detect a click yet. Try clicking again, or press **Next step** if you already did it.`);
-            previousSuccess = false;
+          previousSuccess = false;
             previousError = 'No click detected';
             await delay(3000);
             continue;
@@ -820,6 +887,7 @@ const SidePanel: React.FC = () => {
           let detected = false;
           let manualUsedThisStep = false;
           for (let i = 0; i < 18; i++) {
+            if (myRunId !== executionRunIdRef.current) return;
             const manual = consumeManualAdvance();
             if (manual.advanced) {
               detected = true;
@@ -896,10 +964,18 @@ const SidePanel: React.FC = () => {
   };
 
   const clearHistory = () => {
+    // Cancel any in-flight execution loop immediately.
+    executionRunIdRef.current += 1;
     setMessages([]);
     setSession(null);
+    setStatus('idle');
+    setInputValue('');
+    manualAdvanceRef.current = false;
+    manualAdvanceNoteRef.current = '';
+    forceAdvanceRef.current = false;
     chrome.storage.local.remove(['chatHistory', 'sessionState']);
     spokenMessageIdsRef.current.clear();
+    sendMessageToContent({ type: 'CLEAR_HIGHLIGHTS', target: 'content' }).catch(() => {});
   };
 
   const toggleSpeechInput = async () => {
@@ -1089,6 +1165,7 @@ const SidePanel: React.FC = () => {
                 onClick={() => {
                   manualAdvanceRef.current = true;
                   manualAdvanceNoteRef.current = 'Manual advance button pressed';
+                  forceAdvanceRef.current = true;
                   addAgentMessage('➡️ Manual advance requested. Moving to the next step.');
                 }}
                 className="text-sm text-white bg-orange-500 hover:bg-orange-600 px-3 py-1 rounded transition-colors"
@@ -1108,12 +1185,12 @@ const SidePanel: React.FC = () => {
             >
               🔊 {speechOutputEnabled ? 'On' : 'Off'}
             </button>
-            <button
-              onClick={clearHistory}
-              className="text-sm text-gray-600 hover:text-gray-800 px-3 py-1 rounded hover:bg-gray-100 transition-colors"
-            >
+          <button
+            onClick={clearHistory}
+            className="text-sm text-gray-600 hover:text-gray-800 px-3 py-1 rounded hover:bg-gray-100 transition-colors"
+          >
               Clear History
-            </button>
+          </button>
           </div>
         </div>
         

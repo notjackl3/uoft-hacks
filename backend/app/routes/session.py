@@ -52,10 +52,23 @@ def _same_domain(a: str, b: str) -> bool:
     return _domain_from_url(a) != "" and _domain_from_url(a) == _domain_from_url(b)
 
 def _brand_key(domain: str) -> str:
-    parts = [p for p in (domain or "").split(".") if p]
+    """
+    Extract a "brand-ish" label from a hostname.
+    Handles common second-level TLD patterns like co.uk, com.au, etc.
+    Examples:
+      - www.amazon.com   -> amazon
+      - www.amazon.ca    -> amazon
+      - www.amazon.co.uk -> amazon
+    """
+    parts = [p for p in (domain or "").lower().split(".") if p and p != "www"]
     if len(parts) < 2:
-        return domain or ""
-    return parts[-2]
+        return parts[0] if parts else ""
+
+    sld = parts[-2]
+    # If the SLD is a generic bucket (co/com/org/net/...), use the label before it.
+    if sld in {"co", "com", "org", "net", "gov", "edu"} and len(parts) >= 3:
+        return parts[-3]
+    return sld
 
 
 def _domain_matches(target_domain: str, current_domain: str) -> bool:
@@ -65,8 +78,8 @@ def _domain_matches(target_domain: str, current_domain: str) -> bool:
     - accepts subdomains
     - accepts same brand label (useful for amazon.ca vs amazon.com)
     """
-    td = (target_domain or "").lower().lstrip(".")
-    cd = (current_domain or "").lower().lstrip(".")
+    td = (target_domain or "").strip().lower().lstrip(".")
+    cd = (current_domain or "").strip().lower().lstrip(".")
     if not td or not cd:
         return False
 
@@ -368,6 +381,10 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
     if request.previous_action_result.success and last_sent == current_step_number:
         current_step_number += 1
 
+    # Force advance: used by the UI "Next step" manual button.
+    if request.force_advance:
+        current_step_number = max(current_step_number, last_sent) + 1
+
     mode = session_doc.get("mode") or "planned"
     canonical_goal = session_doc.get("canonical_goal") or session_doc.get("user_goal") or ""
     target_domain = session_doc.get("target_domain")
@@ -378,6 +395,7 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
         mode == "single_step"
         and target_domain
         and request.url
+        and not request.force_advance
         and not _domain_matches(target_domain, _domain_from_url(request.url))
     ):
         url_line = target_url or f"https://{target_domain}/"
@@ -502,7 +520,7 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
 
         # Adaptive behavior: if we can't match the current step to the current DOM,
         # and the page/DOM has changed since we last saw it, re-plan from the current page.
-        if not match.get("matched", False) and request.url:
+        if mode != "single_step" and (not match.get("matched", False)) and request.url:
             curr_sig = _features_signature(request.page_features)
             url_changed = bool(last_seen_url and request.url and request.url != last_seen_url)
             sig_changed = bool(last_seen_sig and curr_sig and curr_sig != last_seen_sig)

@@ -34,6 +34,12 @@ export interface UserPromptMessage extends ChromeMessage {
 // Message to get page features without performing any action
 export interface GetFeaturesMessage extends ChromeMessage {
   type: 'GET_FEATURES';
+  payload?: {
+    // Optional filtering to reduce noise + improve matching
+    types?: Array<'input' | 'button' | 'link'>;
+    keywords?: string[]; // used for ranking (not sent to backend unless you include it)
+    limit?: number; // default chosen by content script
+  };
   target: 'content';
 }
 

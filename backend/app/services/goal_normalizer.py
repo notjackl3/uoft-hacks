@@ -106,7 +106,8 @@ Return JSON only with:
 }}
 
 Rules:
-- If the user mentions a site name (e.g. Instagram), set target_url and target_domain.
+- Only set target_url/target_domain if the user EXPLICITLY mentions a site/brand or provides a URL in the goal.
+- If you are not sure, set target_url=null and target_domain=null (do NOT guess).
 - target_domain must be just the hostname (no scheme).
 """.strip()
 
@@ -121,6 +122,16 @@ Rules:
         target_domain = None
     canonical_goal = data.get("canonical_goal") or raw_goal
     task_type = data.get("task_type") or "unknown"
+
+    # Post-validate: if the model guessed a domain not present in the user's text, drop it.
+    gl = (raw_goal or "").lower()
+    if target_domain and isinstance(target_domain, str):
+        td = target_domain.lower()
+        url_in_goal = _extract_url(raw_goal) is not None
+        if (td not in gl) and (not url_in_goal):
+            target_domain = None
+            target_url = None
+
     return NormalizedGoal(
         raw_goal=raw_goal,
         canonical_goal=str(canonical_goal),

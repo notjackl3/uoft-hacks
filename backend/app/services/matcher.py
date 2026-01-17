@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import string
 from typing import Dict, List, Optional
 
 from app.config import settings
@@ -68,6 +69,48 @@ def _selector_matches(selector: str, pattern: Optional[str]) -> bool:
         # Treat invalid regex as plain substring
         return normalize_text(pattern) in normalize_text(selector)
 
+_STOPWORDS = {
+    "click",
+    "press",
+    "tap",
+    "select",
+    "open",
+    "choose",
+    "button",
+    "link",
+    "menu",
+    "field",
+    "input",
+    "text",
+    "type",
+    "enter",
+    "the",
+    "a",
+    "an",
+    "to",
+    "on",
+    "in",
+    "of",
+    "and",
+    "for",
+    "with",
+}
+
+
+def _keywords_from_step_description(desc: Optional[str]) -> List[str]:
+    d = normalize_text(desc or "")
+    if not d:
+        return []
+    # split on whitespace and punctuation, keep meaningful tokens
+    d = d.translate(str.maketrans({c: " " for c in string.punctuation}))
+    toks = [t for t in d.split() if len(t) >= 3 and t not in _STOPWORDS]
+    # de-dupe preserve order
+    out: List[str] = []
+    for t in toks:
+        if t not in out:
+            out.append(t)
+    return out[:5]
+
 
 def match_element_to_step(current_step: PlannedStep, page_features: List[PageFeature]) -> Dict:
     """
@@ -76,6 +119,7 @@ def match_element_to_step(current_step: PlannedStep, page_features: List[PageFea
     """
     page_features = _filter_features_for_step(current_step, page_features)
     target_hints = current_step.target_hints
+    implied_text = _keywords_from_step_description(current_step.description) if not target_hints.text_contains else []
     best: Dict = {"matched": False, "feature_index": None, "confidence": 0.0, "feature": None}
     best_conf = 0.0
 
@@ -90,10 +134,11 @@ def match_element_to_step(current_step: PlannedStep, page_features: List[PageFea
                 score += WEIGHTS["type"]
 
         # Text contains (feature.text OR aria_label)
-        if target_hints.text_contains:
+        needles = target_hints.text_contains or implied_text
+        if needles:
             max_score += WEIGHTS["text"]
             combined = f"{feature.text or ''} {feature.aria_label or ''}"
-            if _contains_any(combined, target_hints.text_contains):
+            if _contains_any(combined, needles):
                 score += WEIGHTS["text"]
 
         # Placeholder contains
@@ -156,7 +201,7 @@ async def fallback_to_openai(current_step: PlannedStep, page_features: List[Page
         return {"matched": False, "feature_index": None, "confidence": 0.0, "feature": None}
 
     # Ultra-compact format
-    elements = " | ".join([f"{f.index}:{f.type[0]}:{f.text or '-'}" for f in page_features[:15]])
+    elements = " | ".join([f"{f.index}:{f.type[0]}:{f.text or '-'}" for f in page_features[:30]])
     text_part = f" text:{current_step.text_input}" if current_step.text_input else ""
 
     prompt = f"""Match: {current_step.action} {current_step.description}{text_part}

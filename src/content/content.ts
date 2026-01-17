@@ -73,7 +73,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message.type === 'GET_FEATURES') {
     // Just extract and return features - no actions
-    const result = extractPageFeatures();
+    const result = extractPageFeatures(message.payload);
     sendResponse(result);
     return true;
   }
@@ -122,7 +122,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
  * Extract all interactive elements from the page
  * Returns them in the format expected by the backend API
  */
-function extractPageFeatures(): ContentResponse {
+function extractPageFeatures(options?: {
+  types?: Array<'input' | 'button' | 'link'>;
+  keywords?: string[];
+  limit?: number;
+}): ContentResponse {
   const pageTitle = document.title;
   const pageUrl = window.location.href;
 
@@ -131,7 +135,7 @@ function extractPageFeatures(): ContentResponse {
 
   // Collect inputs first (usually most important for forms)
   const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="button"]):not([type="submit"]), textarea, select'));
-  inputs.slice(0, 10).forEach((input) => {
+  inputs.slice(0, 30).forEach((input) => {
     const el = input as HTMLInputElement;
     if (!isVisible(el)) return;
     
@@ -153,7 +157,7 @@ function extractPageFeatures(): ContentResponse {
 
   // Collect buttons
   const buttons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]'));
-  buttons.slice(0, 15).forEach((button) => {
+  buttons.slice(0, 40).forEach((button) => {
     const el = button as HTMLElement;
     if (!isVisible(el)) return;
     
@@ -172,7 +176,7 @@ function extractPageFeatures(): ContentResponse {
 
   // Collect links
   const links = Array.from(document.querySelectorAll('a[href]'));
-  links.slice(0, 15).forEach((link) => {
+  links.slice(0, 60).forEach((link) => {
     const el = link as HTMLAnchorElement;
     if (!isVisible(el)) return;
     
@@ -201,19 +205,49 @@ function extractPageFeatures(): ContentResponse {
     return true;
   });
 
+  // Optional filter + rank for relevance
+  const desiredTypes = options?.types?.length ? new Set(options.types) : null;
+  const keywords = (options?.keywords || [])
+    .map((k) => (k || '').toLowerCase().trim())
+    .filter((k) => k.length >= 2)
+    .slice(0, 8);
+  const limit = Math.max(5, Math.min(options?.limit ?? 120, 400));
+
+  let filtered = uniqueFeatures;
+  if (desiredTypes) {
+    filtered = filtered.filter((f) => desiredTypes.has(f.type));
+  }
+
+  if (keywords.length) {
+    const scoreOf = (f: PageFeature) => {
+      const blob = `${f.text || ''} ${f.aria_label || ''} ${f.placeholder || ''} ${f.href || ''}`.toLowerCase();
+      let score = 0;
+      for (const k of keywords) {
+        if (k && blob.includes(k)) score += 1;
+      }
+      return score;
+    };
+    filtered = filtered
+      .map((f) => ({ f, s: scoreOf(f) }))
+      .sort((a, b) => b.s - a.s)
+      .map((x) => x.f);
+  }
+
+  const limited = filtered.slice(0, limit);
+
   // Reindex
-  uniqueFeatures.forEach((f, idx) => {
+  limited.forEach((f, idx) => {
     f.index = idx;
   });
 
   // Debug log: what the agent can "see"
   try {
     console.groupCollapsed(
-      `[Big Brother] Extracted ${uniqueFeatures.length} interactive elements`,
+      `[Big Brother] Extracted ${limited.length} interactive elements`,
       pageUrl
     );
     console.table(
-      uniqueFeatures.map((f) => ({
+      limited.map((f) => ({
         index: f.index,
         type: f.type,
         text: f.text,
@@ -226,15 +260,15 @@ function extractPageFeatures(): ContentResponse {
     );
     console.groupEnd();
   } catch {
-    console.log(`Extracted ${uniqueFeatures.length} features from page`);
+    console.log(`Extracted ${limited.length} features from page`);
   }
 
   return {
     success: true,
     pageTitle,
     pageUrl,
-    features: uniqueFeatures,
-    message: `Found ${uniqueFeatures.length} interactive elements`,
+    features: limited,
+    message: `Found ${limited.length} interactive elements`,
   };
 }
 

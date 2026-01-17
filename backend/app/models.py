@@ -71,6 +71,7 @@ class NextActionRequest(BaseModel):
     page_features: List[PageFeature]
     url: Optional[str] = None
     page_title: Optional[str] = None
+    force_advance: bool = False
     previous_action_result: PreviousActionResult = Field(default_factory=PreviousActionResult)
 
 
