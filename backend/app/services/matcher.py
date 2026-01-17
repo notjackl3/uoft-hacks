@@ -24,6 +24,32 @@ WEIGHTS = {
     "selector": 10,
 }
 
+def _filter_features_for_step(current_step: PlannedStep, page_features: List[PageFeature]) -> List[PageFeature]:
+    """
+    Reduce candidate elements based on the step's action to lower confusion + shrink LLM fallback prompts.
+    - CLICK: buttons + links
+    - TYPE: inputs
+    - otherwise: all
+    If target_hints.type is present, restrict to that type.
+    """
+    if not page_features:
+        return []
+
+    # If hints specify a type, use that first.
+    hinted_type = (current_step.target_hints.type or "").strip().lower()
+    if hinted_type:
+        filtered = [f for f in page_features if normalize_text(f.type) == normalize_text(hinted_type)]
+        return filtered or page_features
+
+    action = (current_step.action or "").upper()
+    if action == "CLICK":
+        filtered = [f for f in page_features if f.type in ("button", "link")]
+        return filtered or page_features
+    if action == "TYPE":
+        filtered = [f for f in page_features if f.type == "input"]
+        return filtered or page_features
+    return page_features
+
 
 def _contains_any(haystack: str, needles: List[str]) -> bool:
     h = normalize_text(haystack)
@@ -48,6 +74,7 @@ def match_element_to_step(current_step: PlannedStep, page_features: List[PageFea
     Match planned step to actual page feature using a simple weighted scoring algorithm.
     This does NOT call any LLM - it's purely algorithmic.
     """
+    page_features = _filter_features_for_step(current_step, page_features)
     target_hints = current_step.target_hints
     best: Dict = {"matched": False, "feature_index": None, "confidence": 0.0, "feature": None}
     best_conf = 0.0
@@ -124,6 +151,7 @@ async def fallback_to_openai(current_step: PlannedStep, page_features: List[Page
     
     Includes rate limiting and retry logic.
     """
+    page_features = _filter_features_for_step(current_step, page_features)
     if not page_features:
         return {"matched": False, "feature_index": None, "confidence": 0.0, "feature": None}
 
@@ -140,7 +168,7 @@ Reply JSON: {{"index":N,"confidence":0.9}} or {{"index":null,"confidence":0}}"""
     logger.info("OPENAI MATCHER FALLBACK REQUEST")
     logger.info("=" * 60)
     logger.info(f"Step: {current_step.action} - {current_step.description}")
-    logger.info(f"Features count: {len(page_features)}")
+    logger.info(f"Features count (filtered): {len(page_features)}")
     logger.info(f"Prompt length: {len(prompt)} characters")
     logger.info("-" * 60)
     logger.info("FULL PROMPT:")

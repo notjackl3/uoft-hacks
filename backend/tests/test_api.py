@@ -14,37 +14,44 @@ async def test_session_flow_start_next_correct_status(fake_db, monkeypatch):
     async def _embed_text(_text: str):
         return [0.0] * 8
 
-    async def _generate_workflow_plan(user_goal, initial_features, url, page_title=""):
-        return [
-            PlannedStep(
+    async def _normalize_goal_llm(_raw_goal: str):
+        # Pretend we inferred the target domain from the goal so /start does not short-circuit.
+        from app.services.goal_normalizer import NormalizedGoal
+
+        return NormalizedGoal(
+            raw_goal=_raw_goal,
+            canonical_goal=_raw_goal,
+            target_url=None,
+            target_domain="example.com",
+            task_type="unknown",
+        )
+
+    async def _select_next_step(step_number, canonical_goal, url, page_title, page_features, recent_steps=None):
+        # Return deterministic steps in "single_step" mode.
+        if step_number == 1:
+            return PlannedStep(
                 step_number=1,
                 action="CLICK",
                 description="Click the search bar",
                 target_hints=TargetHints(type="input", text_contains=["search"], placeholder_contains=["search"]),
                 expected_page_change=False,
-            ),
-            PlannedStep(
+            )
+        if step_number == 2:
+            return PlannedStep(
                 step_number=2,
                 action="TYPE",
                 description="Type the query",
                 target_hints=TargetHints(type="input", text_contains=["search"], placeholder_contains=["search"]),
                 text_input="wireless mouse",
                 expected_page_change=False,
-            ),
-            PlannedStep(
-                step_number=3,
-                action="CLICK",
-                description="Click Go",
-                target_hints=TargetHints(type="button", text_contains=["go"]),
-                expected_page_change=True,
-            ),
-            PlannedStep(step_number=4, action="DONE", description="Done", target_hints=TargetHints()),
-        ]
+            )
+        return PlannedStep(step_number=step_number, action="DONE", description="Done", target_hints=TargetHints())
 
     import app.routes.session as session_routes
 
     monkeypatch.setattr(session_routes, "embed_text", _embed_text)
-    monkeypatch.setattr(session_routes, "generate_workflow_plan", _generate_workflow_plan)
+    monkeypatch.setattr(session_routes, "normalize_goal_llm", _normalize_goal_llm)
+    monkeypatch.setattr(session_routes, "select_next_step", _select_next_step)
 
     app = create_app(with_db=False)
     app.dependency_overrides[get_db] = lambda: fake_db

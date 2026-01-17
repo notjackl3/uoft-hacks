@@ -5,6 +5,61 @@ console.log('Big Brother: Content script loaded on', window.location.href);
 
 // Track currently highlighted elements for cleanup
 let highlightedElements: Map<HTMLElement, { outline: string; boxShadow: string }> = new Map();
+let highlightOverlay: HTMLDivElement | null = null;
+let highlightOverlayRAF: number | null = null;
+let currentHighlightedEl: HTMLElement | null = null;
+
+function ensureHighlightOverlay(): HTMLDivElement {
+  if (highlightOverlay && document.documentElement.contains(highlightOverlay)) return highlightOverlay;
+  const el = document.createElement('div');
+  el.id = 'bb-highlight-overlay';
+  el.style.cssText = `
+    position: fixed;
+    pointer-events: none;
+    z-index: 2147483647;
+    border: 3px solid #ff0000;
+    box-shadow: 0 0 0 4px rgba(255,0,0,0.35);
+    border-radius: 6px;
+    left: 0; top: 0; width: 0; height: 0;
+    transform: translate3d(0,0,0);
+    display: none;
+  `;
+  document.documentElement.appendChild(el);
+  highlightOverlay = el;
+  return el;
+}
+
+function positionOverlayForElement(target: HTMLElement) {
+  const overlay = ensureHighlightOverlay();
+  const rect = target.getBoundingClientRect();
+  const pad = 2;
+  overlay.style.left = `${Math.max(0, rect.left - pad)}px`;
+  overlay.style.top = `${Math.max(0, rect.top - pad)}px`;
+  overlay.style.width = `${Math.max(0, rect.width + pad * 2)}px`;
+  overlay.style.height = `${Math.max(0, rect.height + pad * 2)}px`;
+  overlay.style.display = rect.width > 0 && rect.height > 0 ? 'block' : 'none';
+}
+
+function startOverlayTracking(target: HTMLElement) {
+  currentHighlightedEl = target;
+  const tick = () => {
+    if (!currentHighlightedEl || !document.body.contains(currentHighlightedEl)) {
+      stopOverlayTracking();
+      return;
+    }
+    positionOverlayForElement(currentHighlightedEl);
+    highlightOverlayRAF = window.requestAnimationFrame(tick);
+  };
+  if (highlightOverlayRAF) window.cancelAnimationFrame(highlightOverlayRAF);
+  highlightOverlayRAF = window.requestAnimationFrame(tick);
+}
+
+function stopOverlayTracking() {
+  if (highlightOverlayRAF) window.cancelAnimationFrame(highlightOverlayRAF);
+  highlightOverlayRAF = null;
+  currentHighlightedEl = null;
+  if (highlightOverlay) highlightOverlay.style.display = 'none';
+}
 
 // Listen for messages from the side panel (via background script)
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -92,6 +147,7 @@ function extractPageFeatures(): ContentResponse {
       selector: generateSelector(el),
       placeholder: placeholder || undefined,
       aria_label: ariaLabel || label || undefined,
+      value_len: typeof (el as any).value === 'string' ? ((el as any).value as string).length : 0,
     });
   });
 
@@ -164,6 +220,7 @@ function extractPageFeatures(): ContentResponse {
         placeholder: f.placeholder || '',
         aria_label: f.aria_label || '',
         href: f.href || '',
+        value_len: f.value_len ?? 0,
         selector: f.selector,
       }))
     );
@@ -379,6 +436,7 @@ function clearAllHighlights(): void {
     element.style.boxShadow = original.boxShadow;
   });
   highlightedElements.clear();
+  stopOverlayTracking();
   
   // Remove the pointer if it exists
   const pointer = document.getElementById('bb-pointer');
@@ -391,37 +449,46 @@ function clearAllHighlights(): void {
  * Highlight an element by its index
  */
 async function highlightElementByIndex(payload: {
-  targetIndex: number;
+  targetIndex?: number;
+  selector?: string;
   duration?: number;
 }): Promise<ContentResponse> {
-  const { targetIndex, duration = 5000 } = payload;
-  
-  // Re-extract features to get fresh selectors
-  const { features } = extractPageFeatures();
-  const feature = features?.find((f) => f.index === targetIndex);
-  
-  if (!feature) {
-    console.warn('[Big Brother] HIGHLIGHT_ELEMENT: feature index not found', {
-      targetIndex,
-      availableCount: features?.length ?? 0,
-    });
-    return { success: false, error: `Element with index ${targetIndex} not found` };
+  const { targetIndex, selector, duration = 5000 } = payload;
+
+  // Prefer stable selector (indices can change across scans).
+  let resolvedSelector: string | null = selector || null;
+  let labelText = '';
+
+  if (!resolvedSelector && typeof targetIndex === 'number') {
+    const { features } = extractPageFeatures();
+    const feature = features?.find((f) => f.index === targetIndex);
+    if (!feature) {
+      console.warn('[Big Brother] HIGHLIGHT_ELEMENT: feature index not found', {
+        targetIndex,
+        availableCount: features?.length ?? 0,
+      });
+      return { success: false, error: `Element with index ${targetIndex} not found` };
+    }
+    resolvedSelector = feature.selector;
+    labelText = feature.text || '';
   }
-  
+
+  if (!resolvedSelector) {
+    return { success: false, error: 'No selector/targetIndex provided' };
+  }
+
   console.log('[Big Brother] HIGHLIGHT_ELEMENT: resolving selector', {
     targetIndex,
-    selector: feature.selector,
-    type: feature.type,
-    text: feature.text,
+    selector: resolvedSelector,
   });
 
-  const element = getElementBySelector(feature.selector);
+  const element = getElementBySelector(resolvedSelector);
   if (!element) {
     console.warn('[Big Brother] HIGHLIGHT_ELEMENT: selector did not match any element', {
       targetIndex,
-      selector: feature.selector,
+      selector: resolvedSelector,
     });
-    return { success: false, error: `Could not find element: ${feature.selector}` };
+    return { success: false, error: `Could not find element: ${resolvedSelector}` };
   }
   
   // Clear previous highlights
@@ -431,6 +498,7 @@ async function highlightElementByIndex(payload: {
   element.scrollIntoView({ behavior: 'smooth', block: 'center' });
   
   // Highlight the element
+  startOverlayTracking(element);
   highlightElement(element, duration);
   
   // Show pointer
@@ -438,8 +506,7 @@ async function highlightElementByIndex(payload: {
   
   return { 
     success: true, 
-    message: `Highlighted: ${feature.text}`,
-    features: [feature]
+    message: `Highlighted: ${labelText || (element.getAttribute('aria-label') || '') || 'element'}`,
   };
 }
 
@@ -514,9 +581,10 @@ function movePointerToElement(element: HTMLElement): void {
 async function waitForEvent(payload: {
   event: 'click' | 'input' | 'scroll';
   targetIndex?: number | null;
+  selector?: string;
   timeoutMs?: number;
 }): Promise<ContentResponse> {
-  const { event, targetIndex = null, timeoutMs = 30000 } = payload || {};
+  const { event, targetIndex = null, selector, timeoutMs = 30000 } = payload || {};
 
   // scroll is global
   if (event === 'scroll') {
@@ -538,20 +606,21 @@ async function waitForEvent(payload: {
     });
   }
 
-  if (targetIndex === null) {
-    return { success: false, error: 'No targetIndex provided' };
+  // Prefer stable selector, fallback to targetIndex.
+  let resolvedSelector: string | null = selector || null;
+  if (!resolvedSelector && targetIndex !== null) {
+    const { features } = extractPageFeatures();
+    const feature = features?.find((f) => f.index === targetIndex);
+    if (feature) resolvedSelector = feature.selector;
   }
 
-  // Re-extract features to get fresh selectors
-  const { features } = extractPageFeatures();
-  const feature = features?.find((f) => f.index === targetIndex);
-  if (!feature) {
-    return { success: false, error: `Element with index ${targetIndex} not found` };
+  if (!resolvedSelector) {
+    return { success: false, error: 'No selector/targetIndex provided' };
   }
 
-  const element = getElementBySelector(feature.selector);
+  const element = getElementBySelector(resolvedSelector);
   if (!element) {
-    return { success: false, error: `Could not find element: ${feature.selector}` };
+    return { success: false, error: `Could not find element: ${resolvedSelector}` };
   }
 
   return new Promise((resolve) => {

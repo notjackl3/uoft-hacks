@@ -606,6 +606,7 @@ const SidePanel: React.FC = () => {
               placeholder: f.placeholder || '',
               aria_label: f.aria_label || '',
               href: f.href || '',
+              value_len: f.value_len ?? 0,
               selector: f.selector,
             }))
           );
@@ -755,7 +756,8 @@ const SidePanel: React.FC = () => {
         await sendMessageToContent({
           type: 'HIGHLIGHT_ELEMENT',
           payload: {
-            targetIndex: nextAction.target_feature_index,
+            targetIndex: nextAction.target_feature_index ?? undefined,
+            selector: nextAction.target_feature?.selector,
             // Keep the highlight until the next step (or until we clear highlights).
             duration: 0,
           },
@@ -779,7 +781,12 @@ const SidePanel: React.FC = () => {
             }
             const waited = await sendMessageToContent({
               type: 'WAIT_FOR_EVENT',
-              payload: { event: 'click', targetIndex: nextAction.target_feature_index, timeoutMs: 2500 },
+              payload: {
+                event: 'click',
+                targetIndex: nextAction.target_feature_index,
+                selector: nextAction.target_feature?.selector,
+                timeoutMs: 2500,
+              },
               target: 'content',
             });
             if (waited.success) {
@@ -821,7 +828,12 @@ const SidePanel: React.FC = () => {
             }
             const waited = await sendMessageToContent({
               type: 'WAIT_FOR_EVENT',
-              payload: { event: 'input', targetIndex: nextAction.target_feature_index, timeoutMs: 2500 },
+              payload: {
+                event: 'input',
+                targetIndex: nextAction.target_feature_index,
+                selector: nextAction.target_feature?.selector,
+                timeoutMs: 2500,
+              },
               target: 'content',
             });
             if (waited.success) {

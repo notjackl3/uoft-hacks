@@ -10,6 +10,7 @@ export interface PageFeature {
   href?: string;
   placeholder?: string;
   aria_label?: string;
+  value_len?: number;
 }
 
 export interface TargetHints {

@@ -24,11 +24,14 @@ from app.models import (
     SessionStatusResponse,
     StartSessionRequest,
     StartSessionResponse,
+    TargetHints,
 )
 from app.services.corrector import update_hints_from_actual_feature
 from app.services.embeddings import EmbeddingsError, embed_text
 from app.services.matcher import MatcherError, fallback_to_gemini, match_element_to_step
 from app.services.planner import PlannerError, generate_workflow_plan
+from app.services.goal_normalizer import infer_target_from_goal, normalize_goal_llm
+from app.services.step_selector import select_next_step
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -47,6 +50,34 @@ def _domain_from_url(url: str) -> str:
 
 def _same_domain(a: str, b: str) -> bool:
     return _domain_from_url(a) != "" and _domain_from_url(a) == _domain_from_url(b)
+
+def _brand_key(domain: str) -> str:
+    parts = [p for p in (domain or "").split(".") if p]
+    if len(parts) < 2:
+        return domain or ""
+    return parts[-2]
+
+
+def _domain_matches(target_domain: str, current_domain: str) -> bool:
+    """
+    More forgiving than exact match:
+    - ignores www prefix
+    - accepts subdomains
+    - accepts same brand label (useful for amazon.ca vs amazon.com)
+    """
+    td = (target_domain or "").lower().lstrip(".")
+    cd = (current_domain or "").lower().lstrip(".")
+    if not td or not cd:
+        return False
+
+    td_no_www = td[4:] if td.startswith("www.") else td
+    cd_no_www = cd[4:] if cd.startswith("www.") else cd
+
+    if cd_no_www == td_no_www:
+        return True
+    if cd_no_www.endswith("." + td_no_www):
+        return True
+    return _brand_key(cd_no_www) == _brand_key(td_no_www)
 
 
 def _features_signature(features: List[PageFeature]) -> str:
@@ -110,23 +141,86 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
     now = _utcnow()
     session_id = str(uuid4())
 
+    # Goal normalization (cheap heuristic first; LLM only if uncertain).
+    norm = infer_target_from_goal(request.user_goal)
+    if not norm.target_domain:
+        try:
+            norm = await normalize_goal_llm(request.user_goal)
+        except Exception:
+            # If normalization fails, continue with raw goal and no target domain.
+            pass
+
+    # Credit-saving navigation gate: if we know the target domain and we're not on it,
+    # return a manual URL step and do NOT call other LLMs yet.
+    current_domain = _domain_from_url(request.url)
+    if norm.target_domain and current_domain and not _domain_matches(norm.target_domain, current_domain):
+        url_line = norm.target_url or f"https://{norm.target_domain}/"
+        wait_step = PlannedStep(
+            step_number=1,
+            action="WAIT",
+            description=(
+                "Open a new tab, click the address bar, paste this URL, and press Enter:\n"
+                f"{url_line}"
+            ),
+            target_hints=TargetHints(),
+            expected_page_change=True,
+        )
+
+        session_doc = {
+            "session_id": session_id,
+            "user_goal": request.user_goal,
+            "canonical_goal": norm.canonical_goal,
+            "target_domain": norm.target_domain,
+            "target_url": norm.target_url,
+            "goal_embedding": [],
+            "domain": current_domain,
+            "planned_domain": norm.target_domain,
+            "url": request.url,
+            "last_seen_url": request.url,
+            "last_seen_sig": _features_signature(request.initial_page_features),
+            "mode": "single_step",
+            "planned_steps": [wait_step.model_dump()],
+            "current_step_number": 1,
+            "last_sent_step_number": 1,
+            "status": "in_progress",
+            "created_at": now,
+            "updated_at": now,
+        }
+        await db.sessions.insert_one(session_doc)
+
+        return StartSessionResponse(
+            session_id=session_id,
+            planned_steps=[wait_step],
+            total_steps=1,
+            first_step={
+                "step_number": 1,
+                "action": "WAIT",
+                "target_feature_index": None,
+                "instruction": _instruction_for_step(wait_step),
+                "confidence": 1.0,
+            },
+        )
+
     try:
         goal_embedding = await embed_text(request.user_goal)
     except EmbeddingsError as e:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Voyage AI error: {e}") from e
 
+    # Single-step selector mode: generate only the first step for the current page.
+    canonical_goal = getattr(norm, "canonical_goal", None) or request.user_goal
     try:
-        planned_steps = await generate_workflow_plan(
-            user_goal=request.user_goal,
-            initial_features=request.initial_page_features,
+        first_step = await select_next_step(
+            step_number=1,
+            canonical_goal=canonical_goal,
             url=request.url,
             page_title=request.page_title,
+            page_features=request.initial_page_features,
+            recent_steps=None,
         )
-    except PlannerError as e:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Planner error: {e}") from e
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Step selector error: {e}") from e
 
-    if not planned_steps:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Planner returned no steps")
+    planned_steps = [first_step]
 
     # Safety net: for Instagram goals from the wrong site, ensure the first manual step includes the URL line
     # so the frontend can render it as a clickable link.
@@ -148,12 +242,16 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
     session_doc = {
         "session_id": session_id,
         "user_goal": request.user_goal,
+        "canonical_goal": canonical_goal,
+        "target_domain": norm.target_domain,
+        "target_url": norm.target_url,
         "goal_embedding": goal_embedding,
         "domain": _domain_from_url(request.url),
         "planned_domain": _domain_from_url(request.url),
         "url": request.url,
         "last_seen_url": request.url,
         "last_seen_sig": _features_signature(request.initial_page_features),
+        "mode": "single_step",
         "planned_steps": [s.model_dump() for s in planned_steps],
         "current_step_number": first_step.step_number,
         "last_sent_step_number": first_step.step_number,
@@ -264,85 +362,54 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
             },
         )
 
-    # Re-plan if the user navigated to a different domain (manual URL bar / new tab),
-    # so we can generate steps based on the *new* DOM.
-    if request.previous_action_result.success and request.url:
-        planned_domain = session_doc.get("planned_domain") or session_doc.get("domain") or ""
-        current_domain = _domain_from_url(request.url)
-        if current_domain and current_domain != planned_domain:
-            try:
-                new_steps = await generate_workflow_plan(
-                    user_goal=session_doc.get("user_goal", ""),
-                    initial_features=request.page_features,
-                    url=request.url,
-                    page_title=request.page_title or "",
-                )
-            except PlannerError as e:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Planner error (replan): {e}"
-                ) from e
-
-            if not new_steps:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Planner returned no steps (replan)"
-                )
-
-            await db.sessions.update_one(
-                {"session_id": request.session_id},
-                {
-                    "$set": {
-                        "planned_steps": [s.model_dump() for s in new_steps],
-                        "current_step_number": new_steps[0].step_number,
-                        "last_sent_step_number": new_steps[0].step_number,
-                        "updated_at": now,
-                        "url": request.url,
-                        "domain": current_domain,
-                        "planned_domain": current_domain,
-                        "status": "in_progress",
-                    }
-                },
-            )
-
-            step = new_steps[0]
-            if step.action in {"SCROLL", "WAIT"}:
-                match = {"matched": True, "feature_index": None, "confidence": 1.0, "feature": None}
-            elif step.action == "DONE":
-                return NextActionResponse(
-                    step_number=step.step_number,
-                    total_steps=len(new_steps),
-                    action="DONE",
-                    target_feature_index=None,
-                    target_feature=None,
-                    instruction=step.description or "Done.",
-                    text_input=None,
-                    confidence=1.0,
-                    expected_page_change=step.expected_page_change,
-                    session_complete=True,
-                )
-            else:
-                match = match_element_to_step(step, request.page_features)
-                if not match["matched"]:
-                    match = await fallback_to_gemini(step, request.page_features)
-
-            return NextActionResponse(
-                step_number=step.step_number,
-                total_steps=len(new_steps),
-                action=step.action,
-                target_feature_index=match["feature_index"],
-                target_feature=match["feature"],
-                instruction=_instruction_for_step(step),
-                text_input=step.text_input,
-                confidence=float(match["confidence"]),
-                expected_page_change=step.expected_page_change,
-                session_complete=False,
-            )
+    # NOTE: legacy full-plan "replan on domain change" removed.
 
     # Only advance if the client reports success for the last action we sent.
     if request.previous_action_result.success and last_sent == current_step_number:
         current_step_number += 1
 
-    # If we advanced past the end, mark complete.
-    if current_step_number > total_steps:
+    mode = session_doc.get("mode") or "planned"
+    canonical_goal = session_doc.get("canonical_goal") or session_doc.get("user_goal") or ""
+    target_domain = session_doc.get("target_domain")
+    target_url = session_doc.get("target_url")
+
+    # If we are in single_step mode and the user is still on the wrong domain, keep returning a manual WAIT step.
+    if (
+        mode == "single_step"
+        and target_domain
+        and request.url
+        and not _domain_matches(target_domain, _domain_from_url(request.url))
+    ):
+        url_line = target_url or f"https://{target_domain}/"
+        step = PlannedStep(
+            step_number=current_step_number,
+            action="WAIT",
+            description=(
+                "Open a new tab, click the address bar, paste this URL, and press Enter:\n"
+                f"{url_line}"
+            ),
+            target_hints=TargetHints(),
+            expected_page_change=True,
+        )
+        await db.sessions.update_one(
+            {"session_id": request.session_id},
+            {"$set": {"current_step_number": current_step_number, "last_sent_step_number": current_step_number, "updated_at": now}},
+        )
+        return NextActionResponse(
+            step_number=step.step_number,
+            total_steps=step.step_number,
+            action=step.action,
+            target_feature_index=None,
+            target_feature=None,
+            instruction=_instruction_for_step(step),
+            text_input=None,
+            confidence=1.0,
+            expected_page_change=True,
+            session_complete=False,
+        )
+
+    # In single_step mode, we never "run out" of steps; we keep generating.
+    if mode != "single_step" and current_step_number > total_steps:
         await db.sessions.update_one(
             {"session_id": request.session_id},
             {"$set": {"status": "completed", "updated_at": now, "current_step_number": total_steps}},
@@ -361,7 +428,36 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
         )
 
     step = _step_from_session(session_doc, current_step_number)
-    if not step:
+    if mode == "single_step" and (step is None):
+        # Generate the next step on-demand and append it to planned_steps
+        try:
+            new_step = await select_next_step(
+                step_number=current_step_number,
+                canonical_goal=canonical_goal,
+                url=request.url or session_doc.get("url", ""),
+                page_title=request.page_title or "",
+                page_features=request.page_features,
+                recent_steps=[PlannedStep.model_validate(s) for s in (session_doc.get("planned_steps") or [])],
+            )
+        except Exception as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Step selector error: {e}") from e
+
+        steps_list = session_doc.get("planned_steps") or []
+        steps_list.append(new_step.model_dump())
+        await db.sessions.update_one(
+            {"session_id": request.session_id},
+            {
+                "$set": {
+                    "planned_steps": steps_list,
+                    "current_step_number": current_step_number,
+                    "last_sent_step_number": current_step_number,
+                    "updated_at": now,
+                }
+            },
+        )
+        step = new_step
+        total_steps = len(steps_list)
+    elif not step:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Current step not found")
 
     # Default no-target actions

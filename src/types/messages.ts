@@ -52,7 +52,8 @@ export interface ExecuteActionMessage extends ChromeMessage {
 export interface HighlightElementMessage extends ChromeMessage {
   type: 'HIGHLIGHT_ELEMENT';
   payload: {
-    targetIndex: number;
+    targetIndex?: number; // prefer selector when available
+    selector?: string;
     duration?: number; // ms, default 3000
   };
   target: 'content';
@@ -69,7 +70,8 @@ export interface WaitForEventMessage extends ChromeMessage {
   type: 'WAIT_FOR_EVENT';
   payload: {
     event: 'click' | 'input' | 'scroll';
-    targetIndex?: number | null; // required for click/input; ignored for scroll
+    targetIndex?: number | null; // fallback when selector not provided
+    selector?: string; // preferred for click/input
     timeoutMs?: number;
   };
   target: 'content';
@@ -83,6 +85,7 @@ export interface PageFeature {
   href?: string;
   placeholder?: string;
   aria_label?: string;
+  value_len?: number; // only for inputs; avoids sending sensitive text
 }
 
 export interface ContentResponse {

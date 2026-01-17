@@ -14,6 +14,7 @@ class PageFeature(BaseModel):
     href: Optional[str] = None
     placeholder: Optional[str] = None
     aria_label: Optional[str] = None
+    value_len: Optional[int] = 0
 
 
 class TargetHints(BaseModel):
