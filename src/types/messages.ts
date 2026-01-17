@@ -86,6 +86,7 @@ export interface PageFeature {
   placeholder?: string;
   aria_label?: string;
   value_len?: number; // only for inputs; avoids sending sensitive text
+  data_testid?: string; // for React/Cypress apps - stable identifier
 }
 
 export interface ContentResponse {

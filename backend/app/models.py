@@ -59,6 +59,9 @@ class StartSessionResponse(BaseModel):
     planned_steps: List[PlannedStep]
     total_steps: int
     first_step: dict
+    # New fields for task outline and progress tracking
+    task_outline: List[str] = Field(default_factory=list)  # High-level phases
+    current_phase: int = 0  # 0-indexed current phase
 
 
 class PreviousActionResult(BaseModel):
@@ -85,6 +88,10 @@ class NextActionResponse(BaseModel):
     confidence: float
     expected_page_change: bool
     session_complete: bool = False
+    # Progress tracking fields
+    task_outline: List[str] = Field(default_factory=list)  # High-level phases
+    current_phase: int = 0  # 0-indexed current phase
+    completed_phases: List[int] = Field(default_factory=list)  # List of completed phase indices
 
 
 class CorrectionRequest(BaseModel):

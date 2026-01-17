@@ -688,7 +688,7 @@ const SidePanel: React.FC = () => {
             addAgentMessage(`⚠️ I didn't detect scrolling yet. You can scroll again, or press **Next step** if you already did it.`);
             previousSuccess = false;
             previousError = 'No scroll detected';
-            await delay(3000);
+            await delay(1000); // Reduced from 3000ms for faster iteration
             continue;
           }
           previousSuccess = true;
@@ -714,19 +714,18 @@ const SidePanel: React.FC = () => {
             });
             if (!changed) {
               addAgentMessage(
-                '⚠️ I still didn’t detect the page changing. Please do the step above. If you went to the wrong site, go back and open:\nhttps://www.instagram.com/accounts/emailsignup/'
+                '⚠️ I still did not detect the page changing. Please complete the step above.'
               );
               previousSuccess = false;
               previousError = 'No page change detected after manual WAIT step';
-              await delay(5000);
+              await delay(1500); // Reduced from 5000ms for faster iteration
               continue;
             }
           } else {
             // Short wait, but still allow manual override.
-            for (let i = 0; i < 2; i++) {
-              const manual = consumeManualAdvance();
-              if (manual.advanced) break;
-              await delay(1000);
+            const manual = consumeManualAdvance();
+            if (!manual.advanced) {
+              await delay(500); // Reduced from 2x1000ms for faster iteration
             }
           }
           previousSuccess = true;
@@ -742,8 +741,8 @@ const SidePanel: React.FC = () => {
             `Try scrolling or waiting for the page to load.`
           );
           
-          // Highlight nothing, wait a bit and retry
-          await delay(1500);
+          // Highlight nothing, wait briefly and retry
+          await delay(500); // Reduced from 1500ms for faster iteration
           continue;
         }
 
@@ -764,8 +763,8 @@ const SidePanel: React.FC = () => {
           target: 'content',
         });
 
-        // Wait a moment for user to see the highlight
-        await delay(1200);
+        // Brief pause for user to see the highlight
+        await delay(400); // Reduced from 1200ms for faster iteration
 
         // Guidance-only: user performs the action. We just wait for the event.
         if (action === 'CLICK') {
@@ -798,7 +797,7 @@ const SidePanel: React.FC = () => {
             addAgentMessage(`⚠️ I didn't detect a click yet. Try clicking again, or press **Next step** if you already did it.`);
             previousSuccess = false;
             previousError = 'No click detected';
-            await delay(3000);
+            await delay(1000); // Reduced from 3000ms for faster iteration
             continue;
           }
           previousSuccess = true;
@@ -845,7 +844,7 @@ const SidePanel: React.FC = () => {
             addAgentMessage(`⚠️ I didn't detect typing yet. Type again, or press **Next step** if you already did it.`);
             previousSuccess = false;
             previousError = 'No input detected';
-            await delay(3000);
+            await delay(1000); // Reduced from 3000ms for faster iteration
             continue;
           }
           previousSuccess = true;

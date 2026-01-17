@@ -24,6 +24,97 @@ WEIGHTS = {
     "selector": 10,
 }
 
+
+def levenshtein_distance(s1: str, s2: str) -> int:
+    """
+    Calculate the Levenshtein (edit) distance between two strings.
+    Used for fuzzy text matching.
+    """
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    
+    if len(s2) == 0:
+        return len(s1)
+    
+    previous_row = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            # Calculate cost of insertions, deletions, and substitutions
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    
+    return previous_row[-1]
+
+
+def fuzzy_similarity(s1: str, s2: str) -> float:
+    """
+    Calculate fuzzy similarity between two strings (0.0 to 1.0).
+    Uses Levenshtein distance normalized by the longer string length.
+    
+    Handles variations like:
+    - "Sign in" vs "Sign In" vs "SIGN IN" (case insensitive)
+    - "Create repository" vs "Create a new repository" (partial match)
+    """
+    n1 = normalize_text(s1).lower()
+    n2 = normalize_text(s2).lower()
+    
+    if not n1 or not n2:
+        return 0.0
+    
+    # Exact match after normalization
+    if n1 == n2:
+        return 1.0
+    
+    # One is substring of the other (handle "Create" vs "Create a new repository")
+    if n1 in n2 or n2 in n1:
+        # Score based on how much of the longer string is covered
+        return min(len(n1), len(n2)) / max(len(n1), len(n2))
+    
+    # Levenshtein distance based similarity
+    max_len = max(len(n1), len(n2))
+    distance = levenshtein_distance(n1, n2)
+    return max(0.0, 1.0 - (distance / max_len))
+
+
+def _fuzzy_contains_any(haystack: str, needles: List[str], threshold: float = 0.7) -> tuple[bool, float]:
+    """
+    Check if haystack fuzzy-matches any needle.
+    Returns (matched, best_score).
+    
+    Uses both exact substring matching AND fuzzy similarity.
+    """
+    h = normalize_text(haystack).lower()
+    if not h:
+        return False, 0.0
+    
+    best_score = 0.0
+    for n in needles or []:
+        n_norm = normalize_text(n).lower()
+        if not n_norm:
+            continue
+        
+        # Exact substring match (high confidence)
+        if n_norm in h:
+            return True, 1.0
+        
+        # Fuzzy match for each word in haystack
+        h_words = h.split()
+        for h_word in h_words:
+            sim = fuzzy_similarity(h_word, n_norm)
+            if sim > best_score:
+                best_score = sim
+        
+        # Also check overall similarity
+        overall_sim = fuzzy_similarity(h, n_norm)
+        if overall_sim > best_score:
+            best_score = overall_sim
+    
+    return best_score >= threshold, best_score
+
 def _filter_features_for_step(current_step: PlannedStep, page_features: List[PageFeature]) -> List[PageFeature]:
     """
     Reduce candidate elements based on the step's action to lower confusion + shrink LLM fallback prompts.
@@ -52,11 +143,25 @@ def _filter_features_for_step(current_step: PlannedStep, page_features: List[Pag
 
 
 def _contains_any(haystack: str, needles: List[str]) -> bool:
+    """Legacy exact match - kept for backwards compatibility."""
     h = normalize_text(haystack)
     for n in needles or []:
         if normalize_text(n) and normalize_text(n) in h:
             return True
     return False
+
+
+def _contains_any_fuzzy(haystack: str, needles: List[str]) -> tuple[bool, float]:
+    """
+    Enhanced matching that tries exact first, then falls back to fuzzy.
+    Returns (matched, confidence_score).
+    """
+    # Try exact match first
+    if _contains_any(haystack, needles):
+        return True, 1.0
+    
+    # Fall back to fuzzy matching
+    return _fuzzy_contains_any(haystack, needles, threshold=0.7)
 
 
 def _selector_matches(selector: str, pattern: Optional[str]) -> bool:
@@ -71,7 +176,13 @@ def _selector_matches(selector: str, pattern: Optional[str]) -> bool:
 
 def match_element_to_step(current_step: PlannedStep, page_features: List[PageFeature]) -> Dict:
     """
-    Match planned step to actual page feature using a simple weighted scoring algorithm.
+    Match planned step to actual page feature using a weighted scoring algorithm
+    with FUZZY TEXT MATCHING for better generalizability.
+    
+    Handles variations like:
+    - "Sign in" vs "Sign In" vs "SIGN IN"
+    - "Create repository" vs "Create a new repository"
+    
     This does NOT call any LLM - it's purely algorithmic.
     """
     page_features = _filter_features_for_step(current_step, page_features)
@@ -80,8 +191,8 @@ def match_element_to_step(current_step: PlannedStep, page_features: List[PageFea
     best_conf = 0.0
 
     for feature in page_features:
-        score = 0
-        max_score = 0
+        score = 0.0
+        max_score = 0.0
 
         # Type match
         if target_hints.type:
@@ -89,24 +200,28 @@ def match_element_to_step(current_step: PlannedStep, page_features: List[PageFea
             if normalize_text(feature.type) == normalize_text(target_hints.type):
                 score += WEIGHTS["type"]
 
-        # Text contains (feature.text OR aria_label)
+        # Text contains (feature.text OR aria_label) - FUZZY MATCHING
         if target_hints.text_contains:
             max_score += WEIGHTS["text"]
             combined = f"{feature.text or ''} {feature.aria_label or ''}"
-            if _contains_any(combined, target_hints.text_contains):
-                score += WEIGHTS["text"]
+            matched, fuzzy_score = _contains_any_fuzzy(combined, target_hints.text_contains)
+            if matched:
+                # Partial credit based on fuzzy score (minimum 50% if matched)
+                score += WEIGHTS["text"] * max(0.5, fuzzy_score)
 
-        # Placeholder contains
+        # Placeholder contains - FUZZY MATCHING
         if target_hints.placeholder_contains:
             max_score += WEIGHTS["placeholder"]
-            if _contains_any(feature.placeholder or "", target_hints.placeholder_contains):
-                score += WEIGHTS["placeholder"]
+            matched, fuzzy_score = _contains_any_fuzzy(feature.placeholder or "", target_hints.placeholder_contains)
+            if matched:
+                score += WEIGHTS["placeholder"] * max(0.5, fuzzy_score)
 
-        # Role / aria-label (we only have aria_label in feature)
+        # Role / aria-label (we only have aria_label in feature) - FUZZY MATCHING
         if target_hints.role:
             max_score += WEIGHTS["role"]
-            if normalize_text(target_hints.role) in normalize_text(feature.aria_label):
-                score += WEIGHTS["role"]
+            role_sim = fuzzy_similarity(target_hints.role, feature.aria_label or "")
+            if role_sim >= 0.7:
+                score += WEIGHTS["role"] * role_sim
 
         # Selector pattern
         if target_hints.selector_pattern:
@@ -118,7 +233,7 @@ def match_element_to_step(current_step: PlannedStep, page_features: List[PageFea
         if confidence > best_conf:
             best_conf = confidence
             best = {
-                "matched": confidence > 0.5,
+                "matched": confidence > 0.4,  # Lowered threshold for fuzzy matching
                 "feature_index": feature.index,
                 "confidence": float(confidence),
                 "feature": feature,

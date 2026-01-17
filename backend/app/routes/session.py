@@ -32,6 +32,7 @@ from app.services.matcher import MatcherError, fallback_to_gemini, match_element
 from app.services.planner import PlannerError, generate_workflow_plan
 from app.services.goal_normalizer import infer_target_from_goal, normalize_goal_llm
 from app.services.step_selector import select_next_step
+from app.services.unified_planner import unified_plan, infer_target_fast
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -132,29 +133,23 @@ def _instruction_for_step(step: PlannedStep) -> str:
 @router.post("/start", response_model=StartSessionResponse)
 async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase = Depends(get_db)):
     """
-    1. Generate embedding for user_goal
-    2. Call planner to get workflow steps
-    3. Create session in MongoDB
-    4. Match first step to initial_page_features
-    5. Return session_id + first instruction
+    OPTIMIZED: Uses unified_planner for single LLM call that returns:
+    - canonical_goal, target_url, target_domain
+    - task_outline (phases)
+    - first_step
+    
+    This replaces the previous 2-call pattern (normalize_goal + select_step).
     """
     now = _utcnow()
     session_id = str(uuid4())
-
-    # Goal normalization (cheap heuristic first; LLM only if uncertain).
-    norm = infer_target_from_goal(request.user_goal)
-    if not norm.target_domain:
-        try:
-            norm = await normalize_goal_llm(request.user_goal)
-        except Exception:
-            # If normalization fails, continue with raw goal and no target domain.
-            pass
-
-    # Credit-saving navigation gate: if we know the target domain and we're not on it,
-    # return a manual URL step and do NOT call other LLMs yet.
     current_domain = _domain_from_url(request.url)
-    if norm.target_domain and current_domain and not _domain_matches(norm.target_domain, current_domain):
-        url_line = norm.target_url or f"https://{norm.target_domain}/"
+
+    # Fast heuristic check for target URL/domain (no LLM needed)
+    fast_target_url, fast_target_domain = infer_target_fast(request.user_goal)
+    
+    # If target domain is known and we're not on it, return navigation step immediately
+    if fast_target_domain and current_domain and not _domain_matches(fast_target_domain, current_domain):
+        url_line = fast_target_url or f"https://{fast_target_domain}/"
         wait_step = PlannedStep(
             step_number=1,
             action="WAIT",
@@ -165,16 +160,18 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
             target_hints=TargetHints(),
             expected_page_change=True,
         )
+        
+        task_outline = ["Navigate to the website", "Complete the goal"]
 
         session_doc = {
             "session_id": session_id,
             "user_goal": request.user_goal,
-            "canonical_goal": norm.canonical_goal,
-            "target_domain": norm.target_domain,
-            "target_url": norm.target_url,
+            "canonical_goal": request.user_goal,
+            "target_domain": fast_target_domain,
+            "target_url": fast_target_url,
             "goal_embedding": [],
             "domain": current_domain,
-            "planned_domain": norm.target_domain,
+            "planned_domain": fast_target_domain,
             "url": request.url,
             "last_seen_url": request.url,
             "last_seen_sig": _features_signature(request.initial_page_features),
@@ -183,6 +180,12 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
             "current_step_number": 1,
             "last_sent_step_number": 1,
             "status": "in_progress",
+            # New fields for progress tracking
+            "task_outline": task_outline,
+            "current_phase": 0,
+            "completed_phases": [],
+            "step_repeat_count": 0,  # For stuck detection
+            "last_step_description": "",
             "created_at": now,
             "updated_at": now,
         }
@@ -199,55 +202,85 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
                 "instruction": _instruction_for_step(wait_step),
                 "confidence": 1.0,
             },
+            task_outline=task_outline,
+            current_phase=0,
         )
 
+    # UNIFIED PLANNER: Single LLM call for goal normalization + task outline + first step
     try:
-        goal_embedding = await embed_text(request.user_goal)
-    except EmbeddingsError as e:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Voyage AI error: {e}") from e
-
-    # Single-step selector mode: generate only the first step for the current page.
-    canonical_goal = getattr(norm, "canonical_goal", None) or request.user_goal
-    try:
-        first_step = await select_next_step(
-            step_number=1,
-            canonical_goal=canonical_goal,
+        plan_result = await unified_plan(
+            user_goal=request.user_goal,
             url=request.url,
             page_title=request.page_title,
             page_features=request.initial_page_features,
-            recent_steps=None,
         )
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Step selector error: {e}") from e
+        logger.exception("Unified planner failed, falling back to legacy path")
+        # Fallback to legacy normalize + select pattern
+        norm = infer_target_from_goal(request.user_goal)
+        if not norm.target_domain:
+            try:
+                norm = await normalize_goal_llm(request.user_goal)
+            except Exception:
+                pass
+        
+        canonical_goal = getattr(norm, "canonical_goal", None) or request.user_goal
+        try:
+            first_step = await select_next_step(
+                step_number=1,
+                canonical_goal=canonical_goal,
+                url=request.url,
+                page_title=request.page_title,
+                page_features=request.initial_page_features,
+                recent_steps=None,
+            )
+        except Exception as step_e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Step selector error: {step_e}") from step_e
+        
+        plan_result = type('PlanResult', (), {
+            'canonical_goal': canonical_goal,
+            'target_url': norm.target_url,
+            'target_domain': norm.target_domain,
+            'task_outline': ["Complete the task"],
+            'current_phase': 0,
+            'first_step': first_step,
+        })()
+
+    # Check if we need to navigate first (unified planner might have detected this)
+    if plan_result.target_domain and current_domain and not _domain_matches(plan_result.target_domain, current_domain):
+        url_line = plan_result.target_url or f"https://{plan_result.target_domain}/"
+        wait_step = PlannedStep(
+            step_number=1,
+            action="WAIT",
+            description=(
+                "Open a new tab, click the address bar, paste this URL, and press Enter:\n"
+                f"{url_line}"
+            ),
+            target_hints=TargetHints(),
+            expected_page_change=True,
+        )
+        first_step = wait_step
+    else:
+        first_step = plan_result.first_step
 
     planned_steps = [first_step]
+    task_outline = plan_result.task_outline or ["Complete the task"]
+    current_phase = plan_result.current_phase or 0
 
-    # Safety net: for Instagram goals from the wrong site, ensure the first manual step includes the URL line
-    # so the frontend can render it as a clickable link.
     try:
-        if planned_steps and planned_steps[0].action == "WAIT":
-            g = (request.user_goal or "").lower()
-            if "instagram" in g and _domain_from_url(request.url) != "www.instagram.com":
-                url_line = "https://www.instagram.com/accounts/emailsignup/"
-                if url_line not in (planned_steps[0].description or ""):
-                    planned_steps[0].description = (planned_steps[0].description or "").rstrip() + f"\n{url_line}"
-                    planned_steps[0].expected_page_change = True
-    except Exception:
-        # Non-fatal: don't block session creation on string patching.
-        pass
-
-    total_steps = len(planned_steps)
-    first_step = planned_steps[0]
+        goal_embedding = await embed_text(request.user_goal)
+    except EmbeddingsError:
+        goal_embedding = []  # Non-fatal, continue without embedding
 
     session_doc = {
         "session_id": session_id,
         "user_goal": request.user_goal,
-        "canonical_goal": canonical_goal,
-        "target_domain": norm.target_domain,
-        "target_url": norm.target_url,
+        "canonical_goal": plan_result.canonical_goal,
+        "target_domain": plan_result.target_domain,
+        "target_url": plan_result.target_url,
         "goal_embedding": goal_embedding,
-        "domain": _domain_from_url(request.url),
-        "planned_domain": _domain_from_url(request.url),
+        "domain": current_domain,
+        "planned_domain": current_domain,
         "url": request.url,
         "last_seen_url": request.url,
         "last_seen_sig": _features_signature(request.initial_page_features),
@@ -256,6 +289,12 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
         "current_step_number": first_step.step_number,
         "last_sent_step_number": first_step.step_number,
         "status": "in_progress",
+        # New fields for progress tracking
+        "task_outline": task_outline,
+        "current_phase": current_phase,
+        "completed_phases": [],
+        "step_repeat_count": 0,  # For stuck detection
+        "last_step_description": first_step.description or "",
         "created_at": now,
         "updated_at": now,
     }
@@ -305,24 +344,36 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
     return StartSessionResponse(
         session_id=session_id,
         planned_steps=planned_steps,
-        total_steps=total_steps,
+        total_steps=len(task_outline),  # Use outline length as total steps estimate
         first_step=first_step_payload,
+        task_outline=task_outline,
+        current_phase=current_phase,
     )
 
 
 @router.post("/next", response_model=NextActionResponse)
 async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Depends(get_db)):
     """
+    ENHANCED with progress tracking and stuck detection:
     1. Get session from MongoDB
     2. Advance step (if last sent step was executed successfully)
-    3. Match current step to page_features
-    4. If no match, try Gemini fallback
-    5. Log execution
-    6. Return instruction + target
+    3. Track progress against task_outline (phases)
+    4. Detect stuck state (3+ same step without progress)
+    5. Match current step to page_features
+    6. If no match, try Gemini fallback
+    7. Log execution
+    8. Return instruction + target + progress info
     """
     session_doc = await db.sessions.find_one({"session_id": request.session_id})
     if not session_doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+
+    # Extract progress tracking fields
+    task_outline: List[str] = session_doc.get("task_outline") or []
+    current_phase: int = int(session_doc.get("current_phase", 0) or 0)
+    completed_phases: List[int] = session_doc.get("completed_phases") or []
+    step_repeat_count: int = int(session_doc.get("step_repeat_count", 0) or 0)
+    last_step_description: str = str(session_doc.get("last_step_description") or "")
 
     total_steps = len(session_doc.get("planned_steps") or [])
     if total_steps == 0:
@@ -332,7 +383,7 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
         step_number = int(session_doc.get("current_step_number", total_steps))
         return NextActionResponse(
             step_number=step_number,
-            total_steps=total_steps,
+            total_steps=len(task_outline) or total_steps,
             action="DONE",
             target_feature_index=None,
             target_feature=None,
@@ -341,6 +392,9 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
             confidence=1.0,
             expected_page_change=False,
             session_complete=True,
+            task_outline=task_outline,
+            current_phase=current_phase,
+            completed_phases=completed_phases,
         )
 
     now = _utcnow()
@@ -348,8 +402,27 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
     last_sent = int(session_doc.get("last_sent_step_number", current_step_number))
     last_seen_url = str(session_doc.get("last_seen_url") or "")
     last_seen_sig = str(session_doc.get("last_seen_sig") or "")
+    
+    # Progress tracking: if action succeeded, potentially advance phase
+    if request.previous_action_result.success:
+        # Reset stuck counter on success
+        step_repeat_count = 0
+        
+        # Check if current phase is complete (simple heuristic: step succeeded)
+        # Advance to next phase if we have more phases
+        if current_phase < len(task_outline) - 1:
+            # For now, advance phase when step succeeds and URL changes significantly
+            curr_sig = _features_signature(request.page_features)
+            url_changed = bool(last_seen_url and request.url and request.url != last_seen_url)
+            sig_changed = bool(last_seen_sig and curr_sig and curr_sig != last_seen_sig)
+            
+            if url_changed or sig_changed:
+                if current_phase not in completed_phases:
+                    completed_phases.append(current_phase)
+                current_phase += 1
+                logger.info(f"Phase advanced to {current_phase}: {task_outline[current_phase] if current_phase < len(task_outline) else 'DONE'}")
 
-    # Update seen markers (we still use previous values below for change detection).
+    # Update seen markers and progress tracking fields
     if request.url:
         await db.sessions.update_one(
             {"session_id": request.session_id},
@@ -357,6 +430,9 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
                 "$set": {
                     "last_seen_url": request.url,
                     "last_seen_sig": _features_signature(request.page_features),
+                    "current_phase": current_phase,
+                    "completed_phases": completed_phases,
+                    "step_repeat_count": step_repeat_count,
                     "updated_at": now,
                 }
             },
@@ -397,7 +473,7 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
         )
         return NextActionResponse(
             step_number=step.step_number,
-            total_steps=step.step_number,
+            total_steps=len(task_outline) or step.step_number,
             action=step.action,
             target_feature_index=None,
             target_feature=None,
@@ -406,6 +482,9 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
             confidence=1.0,
             expected_page_change=True,
             session_complete=False,
+            task_outline=task_outline,
+            current_phase=current_phase,
+            completed_phases=completed_phases,
         )
 
     # In single_step mode, we never "run out" of steps; we keep generating.
@@ -416,7 +495,7 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
         )
         return NextActionResponse(
             step_number=total_steps,
-            total_steps=total_steps,
+            total_steps=len(task_outline) or total_steps,
             action="DONE",
             target_feature_index=None,
             target_feature=None,
@@ -425,11 +504,15 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
             confidence=1.0,
             expected_page_change=False,
             session_complete=True,
+            task_outline=task_outline,
+            current_phase=len(task_outline) - 1 if task_outline else 0,
+            completed_phases=list(range(len(task_outline))) if task_outline else [],
         )
 
     step = _step_from_session(session_doc, current_step_number)
     if mode == "single_step" and (step is None):
         # Generate the next step on-demand and append it to planned_steps
+        # Include task_outline context for better completion detection
         try:
             new_step = await select_next_step(
                 step_number=current_step_number,
@@ -438,9 +521,59 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
                 page_title=request.page_title or "",
                 page_features=request.page_features,
                 recent_steps=[PlannedStep.model_validate(s) for s in (session_doc.get("planned_steps") or [])],
+                task_outline=task_outline,
+                current_phase=current_phase,
+                completed_phases=completed_phases,
             )
         except Exception as e:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Step selector error: {e}") from e
+
+        # STUCK DETECTION: Check if same step description is repeated 3+ times
+        new_desc = (new_step.description or "").strip().lower()
+        if new_desc and new_desc == last_step_description.strip().lower():
+            step_repeat_count += 1
+            logger.warning(f"Step repeated {step_repeat_count} times: {new_desc[:50]}...")
+        else:
+            step_repeat_count = 0
+            last_step_description = new_step.description or ""
+
+        # If stuck (3+ repeats), try to recover
+        if step_repeat_count >= 3:
+            logger.warning(f"STUCK DETECTED: Same step repeated {step_repeat_count} times. Attempting recovery.")
+            # Recovery: Try to generate a different step by asking LLM to suggest alternative
+            try:
+                recovery_step = await select_next_step(
+                    step_number=current_step_number,
+                    canonical_goal=f"[STUCK - try alternative approach] {canonical_goal}",
+                    url=request.url or session_doc.get("url", ""),
+                    page_title=request.page_title or "",
+                    page_features=request.page_features,
+                    recent_steps=[PlannedStep.model_validate(s) for s in (session_doc.get("planned_steps") or [])],
+                    task_outline=task_outline,
+                    current_phase=current_phase,
+                    completed_phases=completed_phases,
+                )
+                new_step = recovery_step
+                step_repeat_count = 0
+                logger.info("Recovery step generated successfully")
+            except Exception as recovery_e:
+                logger.exception(f"Recovery failed: {recovery_e}")
+                # If recovery fails, return a DONE with error message
+                return NextActionResponse(
+                    step_number=current_step_number,
+                    total_steps=len(task_outline) or total_steps,
+                    action="DONE",
+                    target_feature_index=None,
+                    target_feature=None,
+                    instruction="Task appears stuck. The required element may not be on this page.",
+                    text_input=None,
+                    confidence=0.0,
+                    expected_page_change=False,
+                    session_complete=False,
+                    task_outline=task_outline,
+                    current_phase=current_phase,
+                    completed_phases=completed_phases,
+                )
 
         steps_list = session_doc.get("planned_steps") or []
         steps_list.append(new_step.model_dump())
@@ -451,6 +584,8 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
                     "planned_steps": steps_list,
                     "current_step_number": current_step_number,
                     "last_sent_step_number": current_step_number,
+                    "step_repeat_count": step_repeat_count,
+                    "last_step_description": last_step_description,
                     "updated_at": now,
                 }
             },
@@ -465,6 +600,8 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
         match = {"matched": True, "feature_index": None, "confidence": 1.0, "feature": None}
         match_method = "algorithm"
     elif step.action == "DONE":
+        # Mark all phases as complete
+        all_phases = list(range(len(task_outline))) if task_outline else []
         await db.sessions.update_one(
             {"session_id": request.session_id},
             {
@@ -473,12 +610,14 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
                     "updated_at": now,
                     "current_step_number": current_step_number,
                     "last_sent_step_number": current_step_number,
+                    "current_phase": len(task_outline) - 1 if task_outline else 0,
+                    "completed_phases": all_phases,
                 }
             },
         )
         return NextActionResponse(
             step_number=current_step_number,
-            total_steps=total_steps,
+            total_steps=len(task_outline) or total_steps,
             action="DONE",
             target_feature_index=None,
             target_feature=None,
@@ -487,6 +626,9 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
             confidence=1.0,
             expected_page_change=step.expected_page_change,
             session_complete=True,
+            task_outline=task_outline,
+            current_phase=len(task_outline) - 1 if task_outline else 0,
+            completed_phases=all_phases,
         )
     else:
         match = match_element_to_step(step, request.page_features)
@@ -541,7 +683,7 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
                     elif step.action == "DONE":
                         return NextActionResponse(
                             step_number=step.step_number,
-                            total_steps=len(new_steps),
+                            total_steps=len(task_outline) or len(new_steps),
                             action="DONE",
                             target_feature_index=None,
                             target_feature=None,
@@ -550,6 +692,9 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
                             confidence=1.0,
                             expected_page_change=step.expected_page_change,
                             session_complete=True,
+                            task_outline=task_outline,
+                            current_phase=len(task_outline) - 1 if task_outline else 0,
+                            completed_phases=list(range(len(task_outline))) if task_outline else [],
                         )
                     else:
                         match = match_element_to_step(step, request.page_features)
@@ -558,7 +703,7 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
 
                     return NextActionResponse(
                         step_number=step.step_number,
-                        total_steps=len(new_steps),
+                        total_steps=len(task_outline) or len(new_steps),
                         action=step.action,
                         target_feature_index=match["feature_index"],
                         target_feature=match["feature"],
@@ -567,6 +712,9 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
                         confidence=float(match["confidence"]),
                         expected_page_change=step.expected_page_change,
                         session_complete=False,
+                        task_outline=task_outline,
+                        current_phase=current_phase,
+                        completed_phases=completed_phases,
                     )
 
     # Log suggestion
@@ -594,6 +742,8 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
             "$set": {
                 "current_step_number": current_step_number,
                 "last_sent_step_number": step.step_number,
+                "current_phase": current_phase,
+                "completed_phases": completed_phases,
                 "updated_at": now,
             }
         },
@@ -601,7 +751,7 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
 
     return NextActionResponse(
         step_number=step.step_number,
-        total_steps=total_steps,
+        total_steps=len(task_outline) or total_steps,
         action=step.action,
         target_feature_index=match["feature_index"],
         target_feature=match["feature"],
@@ -610,6 +760,9 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
         confidence=float(match["confidence"]),
         expected_page_change=step.expected_page_change,
         session_complete=False,
+        task_outline=task_outline,
+        current_phase=current_phase,
+        completed_phases=completed_phases,
     )
 
 

@@ -26,6 +26,9 @@ def build_step_selector_prompt(
     page_title: str,
     page_features: List[PageFeature],
     recent_steps: Optional[List[PlannedStep]] = None,
+    task_outline: Optional[List[str]] = None,
+    current_phase: int = 0,
+    completed_phases: Optional[List[int]] = None,
 ) -> str:
     features = [
         {
@@ -38,7 +41,7 @@ def build_step_selector_prompt(
             "selector": f.selector or "",
             "value_len": int(getattr(f, "value_len", 0) or 0),
         }
-        for f in (page_features or [])[:30]
+        for f in (page_features or [])[:40]  # Expanded limit to 40
     ]
     recent = [
         {
@@ -51,6 +54,23 @@ def build_step_selector_prompt(
         }
         for s in (recent_steps or [])[-5:]
     ]
+    
+    # Progress context for completion detection
+    outline_context = ""
+    if task_outline:
+        completed = completed_phases or []
+        outline_items = []
+        for i, phase in enumerate(task_outline):
+            status = "✓ DONE" if i in completed else ("→ CURRENT" if i == current_phase else "  pending")
+            outline_items.append(f"  {i+1}. [{status}] {phase}")
+        outline_context = f"""
+TASK_OUTLINE (high-level phases):
+{chr(10).join(outline_items)}
+
+Current phase: {current_phase + 1} of {len(task_outline)}
+
+IMPORTANT: If all phases are complete OR the goal appears achieved, output action=DONE.
+"""
 
     return f"""
 You are selecting the SINGLE next step for a web tutoring assistant.
@@ -59,6 +79,7 @@ The user is the one who clicks/types; you only provide clear guidance and elemen
 GOAL: {canonical_goal}
 PAGE_TITLE: {page_title}
 URL: {url}
+{outline_context}
 ELEMENTS_JSON: {json.dumps(features, ensure_ascii=False)}
 RECENT_STEPS_JSON: {json.dumps(recent, ensure_ascii=False)}
 
@@ -72,7 +93,7 @@ Rules:
   - placeholder_contains (array, [] if none)
   - selector_pattern (string or null)
 - TYPE must include text_input (or "<EMAIL>", "<PASSWORD>", etc)
-- End with DONE only when the goal is achieved.
+- End with DONE only when the goal is achieved OR all phases are complete.
 
 Output format:
 {{
@@ -98,6 +119,9 @@ async def select_next_step(
     page_title: str,
     page_features: List[PageFeature],
     recent_steps: Optional[List[PlannedStep]] = None,
+    task_outline: Optional[List[str]] = None,
+    current_phase: int = 0,
+    completed_phases: Optional[List[int]] = None,
 ) -> PlannedStep:
     prompt = build_step_selector_prompt(
         canonical_goal=canonical_goal,
@@ -105,6 +129,9 @@ async def select_next_step(
         page_title=page_title,
         page_features=page_features,
         recent_steps=recent_steps,
+        task_outline=task_outline,
+        current_phase=current_phase,
+        completed_phases=completed_phases,
     )
     raw = _call_openai_sync(prompt)
     data = extract_json_object(raw)

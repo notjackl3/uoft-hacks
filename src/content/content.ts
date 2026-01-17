@@ -121,6 +121,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 /**
  * Extract all interactive elements from the page
  * Returns them in the format expected by the backend API
+ * 
+ * EXPANDED LIMITS for generalizability:
+ * - 30 inputs (was 10)
+ * - 40 buttons (was 15)
+ * - 40 links (was 15)
+ * - Additional element types: menuitem, tab, option, summary
  */
 function extractPageFeatures(): ContentResponse {
   const pageTitle = document.title;
@@ -129,9 +135,14 @@ function extractPageFeatures(): ContentResponse {
   const features: PageFeature[] = [];
   let index = 0;
 
-  // Collect inputs first (usually most important for forms)
+  // Helper to get data-testid or data-cy (common in React/Cypress apps)
+  const getTestId = (el: Element): string | undefined => {
+    return el.getAttribute('data-testid') || el.getAttribute('data-cy') || undefined;
+  };
+
+  // Collect inputs first (usually most important for forms) - EXPANDED to 30
   const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="button"]):not([type="submit"]), textarea, select'));
-  inputs.slice(0, 10).forEach((input) => {
+  inputs.slice(0, 30).forEach((input) => {
     const el = input as HTMLInputElement;
     if (!isVisible(el)) return;
     
@@ -139,46 +150,62 @@ function extractPageFeatures(): ContentResponse {
     const ariaLabel = el.getAttribute('aria-label') || '';
     const name = el.getAttribute('name') || '';
     const label = findLabelFor(el);
+    const testId = getTestId(el);
     
     features.push({
-        index: index++,
+      index: index++,
       type: 'input',
       text: label || name || placeholder || el.getAttribute('type') || 'text',
       selector: generateSelector(el),
       placeholder: placeholder || undefined,
       aria_label: ariaLabel || label || undefined,
       value_len: typeof (el as any).value === 'string' ? ((el as any).value as string).length : 0,
+      data_testid: testId,
     });
   });
 
-  // Collect buttons
-  const buttons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]'));
-  buttons.slice(0, 15).forEach((button) => {
+  // Collect buttons - EXPANDED to 40, added more role types
+  const buttonSelectors = [
+    'button',
+    'input[type="button"]',
+    'input[type="submit"]',
+    '[role="button"]',
+    '[role="menuitem"]',
+    '[role="tab"]',
+    '[role="option"]',
+    '[role="switch"]',
+    'details > summary',
+  ].join(', ');
+  const buttons = Array.from(document.querySelectorAll(buttonSelectors));
+  buttons.slice(0, 40).forEach((button) => {
     const el = button as HTMLElement;
     if (!isVisible(el)) return;
     
     const text = el.textContent?.trim() || (el as HTMLInputElement).value || '';
     const ariaLabel = el.getAttribute('aria-label') || '';
+    const testId = getTestId(el);
     if (!text && !ariaLabel) return;
     
     features.push({
-        index: index++,
-        type: 'button',
+      index: index++,
+      type: 'button',
       text: (text || ariaLabel).substring(0, 100),
       selector: generateSelector(el),
       aria_label: ariaLabel || undefined,
+      data_testid: testId,
     });
   });
 
-  // Collect links
+  // Collect links - EXPANDED to 40
   const links = Array.from(document.querySelectorAll('a[href]'));
-  links.slice(0, 15).forEach((link) => {
+  links.slice(0, 40).forEach((link) => {
     const el = link as HTMLAnchorElement;
     if (!isVisible(el)) return;
     
     const text = el.innerText.trim() || el.textContent?.trim() || '';
     const ariaLabel = el.getAttribute('aria-label') || '';
     const href = el.getAttribute('href') || '';
+    const testId = getTestId(el);
     
     if (!text && !ariaLabel) return;
     
@@ -189,13 +216,15 @@ function extractPageFeatures(): ContentResponse {
       selector: generateSelector(el),
       href: href || undefined,
       aria_label: ariaLabel || undefined,
+      data_testid: testId,
     });
   });
 
-  // Deduplicate based on text + type
+  // Deduplicate based on text + type + selector (more precise dedup)
   const seen = new Set<string>();
   const uniqueFeatures = features.filter((f) => {
-    const key = `${f.type}:${f.text}:${f.href || ''}`;
+    // Use selector as part of key to avoid removing different elements with same text
+    const key = `${f.type}:${f.text}:${f.href || ''}:${f.selector}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -377,21 +406,61 @@ function getElementBySelector(selector: string): HTMLElement | null {
 
 /**
  * Generate a unique CSS selector for an element
+ * IMPROVED: Prioritizes data-testid, aria-label, and other stable attributes
  */
 function generateSelector(element: Element): string {
-  // Use ID if available and valid
+  // 1. Try data-testid first (common in React apps, very stable)
+  const testId = element.getAttribute('data-testid');
+  if (testId) {
+    const selector = `[data-testid="${testId}"]`;
+    try {
+      if (document.querySelectorAll(selector).length === 1) {
+        return selector;
+      }
+    } catch {
+      // Invalid selector, continue
+    }
+  }
+
+  // 2. Try data-cy (Cypress test attribute, also stable)
+  const cyId = element.getAttribute('data-cy');
+  if (cyId) {
+    const selector = `[data-cy="${cyId}"]`;
+    try {
+      if (document.querySelectorAll(selector).length === 1) {
+        return selector;
+      }
+    } catch {
+      // Invalid selector, continue
+    }
+  }
+
+  // 3. Use ID if available and valid
   if (element.id && /^[a-zA-Z][\w-]*$/.test(element.id)) {
-      const selector = `#${element.id}`;
-      try {
-        if (document.querySelectorAll(selector).length === 1) {
-          return selector;
-        }
-      } catch (e) {
+    const selector = `#${element.id}`;
+    try {
+      if (document.querySelectorAll(selector).length === 1) {
+        return selector;
+      }
+    } catch {
+      // Invalid selector, continue
+    }
+  }
+
+  // 4. Try aria-label (good for accessible elements)
+  const ariaLabel = element.getAttribute('aria-label');
+  if (ariaLabel && ariaLabel.length < 50) {
+    const selector = `${element.tagName.toLowerCase()}[aria-label="${ariaLabel.replace(/"/g, '\\"')}"]`;
+    try {
+      if (document.querySelectorAll(selector).length === 1) {
+        return selector;
+      }
+    } catch {
       // Invalid selector, continue
     }
   }
   
-  // Try name attribute for inputs
+  // 5. Try name attribute for inputs
   if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA' || element.tagName === 'SELECT') {
     const name = element.getAttribute('name');
     if (name) {
@@ -400,13 +469,28 @@ function generateSelector(element: Element): string {
         if (document.querySelectorAll(selector).length === 1) {
           return selector;
         }
-      } catch (e) {
+      } catch {
+        // Invalid selector, continue
+      }
+    }
+  }
+
+  // 6. Try placeholder for inputs
+  if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA') {
+    const placeholder = element.getAttribute('placeholder');
+    if (placeholder && placeholder.length < 50) {
+      const selector = `${element.tagName.toLowerCase()}[placeholder="${placeholder.replace(/"/g, '\\"')}"]`;
+      try {
+        if (document.querySelectorAll(selector).length === 1) {
+          return selector;
+        }
+      } catch {
         // Invalid selector, continue
       }
     }
   }
   
-  // Try unique class combination
+  // 7. Try unique class combination
   const classes = Array.from(element.classList).filter(c => c && !c.match(/^(hover|focus|active|selected|disabled)/));
   if (classes.length > 0) {
     const selector = `${element.tagName.toLowerCase()}.${classes.slice(0, 3).join('.')}`;
@@ -414,12 +498,31 @@ function generateSelector(element: Element): string {
       if (document.querySelectorAll(selector).length === 1) {
         return selector;
       }
-    } catch (e) {
+    } catch {
       // Invalid selector, continue
     }
   }
+
+  // 8. Try nth-child as a more stable fallback than data-bb-id
+  const parent = element.parentElement;
+  if (parent) {
+    const siblings = Array.from(parent.children);
+    const sameTagSiblings = siblings.filter(s => s.tagName === element.tagName);
+    if (sameTagSiblings.length > 1) {
+      const idx = sameTagSiblings.indexOf(element) + 1;
+      const parentSelector = parent.id ? `#${parent.id}` : parent.tagName.toLowerCase();
+      const selector = `${parentSelector} > ${element.tagName.toLowerCase()}:nth-of-type(${idx})`;
+      try {
+        if (document.querySelectorAll(selector).length === 1) {
+          return selector;
+        }
+      } catch {
+        // Invalid selector, continue
+      }
+    }
+  }
   
-  // Cache with data attribute as last resort
+  // 9. Cache with data attribute as last resort
   const uniqueId = `bb-${selectorCounter++}`;
   elementCache.set(uniqueId, element as HTMLElement);
   element.setAttribute('data-bb-id', uniqueId);
