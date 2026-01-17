@@ -15,7 +15,9 @@ def _call_openai_sync(prompt: str) -> str:
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
+        temperature=0.1,
+        max_tokens=450,
+        response_format={"type": "json_object"},
     )
     return resp.choices[0].message.content or ""
 

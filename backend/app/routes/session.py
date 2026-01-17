@@ -28,7 +28,12 @@ from app.models import (
 )
 from app.services.corrector import update_hints_from_actual_feature
 from app.services.embeddings import EmbeddingsError, embed_text
-from app.services.matcher import MatcherError, fallback_to_gemini, match_element_to_step
+from app.services.matcher import (
+    MatcherError,
+    fallback_to_gemini,
+    match_element_to_step,
+    filter_features_by_relevance,
+)
 from app.services.planner import PlannerError, generate_workflow_plan
 from app.services.goal_normalizer import infer_target_from_goal, normalize_goal_llm
 from app.services.step_selector import select_next_step
@@ -48,53 +53,130 @@ def _domain_from_url(url: str) -> str:
     except Exception:
         return ""
 
-def _same_domain(a: str, b: str) -> bool:
-    return _domain_from_url(a) != "" and _domain_from_url(a) == _domain_from_url(b)
 
 def _brand_key(domain: str) -> str:
     """
-    Extract a "brand-ish" label from a hostname.
-    Handles common second-level TLD patterns like co.uk, com.au, etc.
+    Extract the main brand/company name from a hostname.
+    
     Examples:
-      - www.amazon.com   -> amazon
-      - www.amazon.ca    -> amazon
-      - www.amazon.co.uk -> amazon
+      - www.shopify.com -> shopify
+      - admin.shopify.com -> shopify
+      - accounts.google.com -> google
+      - m.facebook.com -> facebook
+      - amazon.co.uk -> amazon
     """
-    parts = [p for p in (domain or "").lower().split(".") if p and p != "www"]
-    if len(parts) < 2:
-        return parts[0] if parts else ""
-
-    sld = parts[-2]
-    # If the SLD is a generic bucket (co/com/org/net/...), use the label before it.
-    if sld in {"co", "com", "org", "net", "gov", "edu"} and len(parts) >= 3:
-        return parts[-3]
-    return sld
+    if not domain:
+        return ""
+    
+    domain = domain.lower().strip()
+    
+    # Remove protocol if present
+    for prefix in ["https://", "http://", "//"]:
+        if domain.startswith(prefix):
+            domain = domain[len(prefix):]
+            break
+    
+    # Remove path/query/fragment
+    domain = domain.split("/")[0].split("?")[0].split("#")[0]
+    
+    # Split into parts
+    parts = [p for p in domain.split(".") if p]
+    
+    if not parts:
+        return ""
+    
+    # Common prefixes to skip (subdomains)
+    skip_prefixes = {
+        "www", "m", "mobile", "admin", "app", "api", "accounts", 
+        "login", "auth", "secure", "my", "portal", "dashboard"
+    }
+    
+    # Common TLDs and country codes to skip
+    skip_suffixes = {
+        "com", "org", "net", "gov", "edu", "io", "ai", "app", "dev", "me", "tv", "co",
+        "uk", "ca", "au", "de", "fr", "jp", "cn", "in", "br", "ru", "it", "es", "nl",
+        "se", "no", "fi", "dk", "pl", "cz", "at", "ch", "be", "ie", "nz", "za", "mx",
+        "ar", "cl", "kr", "sg", "hk", "tw", "th", "my", "ph", "id", "vn"
+    }
+    
+    # Find the brand: skip prefixes from start, skip suffixes from end
+    start = 0
+    end = len(parts)
+    
+    # Skip known prefixes
+    while start < end and parts[start] in skip_prefixes:
+        start += 1
+    
+    # Skip known suffixes (TLDs, country codes)
+    while end > start and parts[end - 1] in skip_suffixes:
+        end -= 1
+    
+    # The brand should be the first remaining part
+    if start < end:
+        return parts[start]
+    
+    # Fallback: if everything was skipped, try the second-to-last part
+    if len(parts) >= 2 and parts[-2] not in skip_prefixes:
+        return parts[-2]
+    
+    # Last resort: return first part
+    return parts[0] if parts else ""
 
 
 def _domain_matches(target_domain: str, current_domain: str) -> bool:
     """
-    More forgiving than exact match:
-    - ignores www prefix
-    - accepts subdomains
-    - accepts same brand label (useful for amazon.ca vs amazon.com)
+    Simple and flexible domain matching.
+    Returns True if the brand name appears anywhere in either domain.
+    
+    Examples that MATCH:
+    - "shopify.com" vs "admin.shopify.com" -> True
+    - "shopify.com" vs "shopify.ca" -> True  
+    - "instagram.com" vs "www.instagram.com" -> True
+    - "google.com" vs "accounts.google.com" -> True
+    - "amazon.com" vs "amazon.co.uk" -> True
     """
-    td = (target_domain or "").strip().lower().lstrip(".")
-    cd = (current_domain or "").strip().lower().lstrip(".")
-    if not td or not cd:
+    if not target_domain or not current_domain:
         return False
-
-    td_no_www = td[4:] if td.startswith("www.") else td
-    cd_no_www = cd[4:] if cd.startswith("www.") else cd
-
-    if cd_no_www == td_no_www:
+    
+    # Normalize both inputs
+    td = target_domain.lower().strip()
+    cd = current_domain.lower().strip()
+    
+    # Remove protocols
+    for prefix in ["https://", "http://", "//"]:
+        if td.startswith(prefix):
+            td = td[len(prefix):]
+        if cd.startswith(prefix):
+            cd = cd[len(prefix):]
+    
+    # Remove paths, just keep hostname
+    td = td.split("/")[0].split("?")[0].split("#")[0]
+    cd = cd.split("/")[0].split("?")[0].split("#")[0]
+    
+    # Exact match
+    if td == cd:
         return True
-    if cd_no_www.endswith("." + td_no_www):
+    
+    # Extract brand names
+    target_brand = _brand_key(td)
+    current_brand = _brand_key(cd)
+    
+    if not target_brand:
+        return False
+    
+    # Does the target brand appear anywhere in the current domain?
+    if target_brand in cd:
         return True
-    return _brand_key(cd_no_www) == _brand_key(td_no_www)
+    
+    # Check reverse
+    if current_brand and current_brand in td:
+        return True
+    
+    return False
 
 
 def _features_signature(features: List[PageFeature]) -> str:
-    # Small fingerprint to detect meaningful DOM/UI changes.
+    """Small fingerprint to detect meaningful DOM/UI changes."""
     parts: List[str] = []
     for f in (features or [])[:30]:
         parts.append(
@@ -136,7 +218,6 @@ def _replace_step_in_session(session_doc: Dict[str, Any], new_step: PlannedStep)
 
 
 def _instruction_for_step(step: PlannedStep) -> str:
-    # Keep frontend-simple: just echo description; TYPE can include text_input if present.
     if step.action == "TYPE" and step.text_input:
         return f"{step.description} (text: {step.text_input})"
     return step.description
@@ -160,13 +241,17 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
         try:
             norm = await normalize_goal_llm(request.user_goal)
         except Exception:
-            # If normalization fails, continue with raw goal and no target domain.
             pass
 
     # Credit-saving navigation gate: if we know the target domain and we're not on it,
     # return a manual URL step and do NOT call other LLMs yet.
     current_domain = _domain_from_url(request.url)
-    if norm.target_domain and current_domain and not _domain_matches(norm.target_domain, current_domain):
+    target_brand = _brand_key(norm.target_domain) if norm.target_domain else ""
+    
+    # Simple check: does the target brand appear in the current URL?
+    user_on_correct_site = target_brand and target_brand in request.url.lower()
+    
+    if norm.target_domain and not user_on_correct_site:
         url_line = norm.target_url or f"https://{norm.target_domain}/"
         wait_step = PlannedStep(
             step_number=1,
@@ -219,7 +304,6 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
     except EmbeddingsError as e:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Voyage AI error: {e}") from e
 
-    # Single-step selector mode: generate only the first step for the current page.
     canonical_goal = getattr(norm, "canonical_goal", None) or request.user_goal
     try:
         first_step = await select_next_step(
@@ -235,8 +319,7 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
 
     planned_steps = [first_step]
 
-    # Safety net: for Instagram goals from the wrong site, ensure the first manual step includes the URL line
-    # so the frontend can render it as a clickable link.
+    # Safety net: for Instagram goals from the wrong site
     try:
         if planned_steps and planned_steps[0].action == "WAIT":
             g = (request.user_goal or "").lower()
@@ -246,7 +329,6 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
                     planned_steps[0].description = (planned_steps[0].description or "").rstrip() + f"\n{url_line}"
                     planned_steps[0].expected_page_change = True
     except Exception:
-        # Non-fatal: don't block session creation on string patching.
         pass
 
     total_steps = len(planned_steps)
@@ -279,11 +361,24 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
         logger.exception("Failed to create session")
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"MongoDB error: {e}") from e
 
-    match = match_element_to_step(first_step, request.initial_page_features)
+    # Filter features by relevance before matching
+    filtered_features = filter_features_by_relevance(
+        page_features=request.initial_page_features,
+        current_step=first_step,
+        goal=request.user_goal,
+        min_confidence=0.3,
+        max_features=50,
+    )
+
+    logger.info(
+        f"[start_session] Filtered {len(request.initial_page_features)} -> {len(filtered_features)} features"
+    )
+
+    match = match_element_to_step(first_step, filtered_features)
     match_method = "algorithm"
     if not match["matched"] and first_step.action in {"CLICK", "TYPE"}:
         try:
-            match = await fallback_to_gemini(first_step, request.initial_page_features)
+            match = await fallback_to_gemini(first_step, filtered_features)
             match_method = "gemini_fallback"
         except MatcherError as e:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Gemini matcher error: {e}") from e
@@ -296,6 +391,8 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
                 "step_number": first_step.step_number,
                 "planned_action": first_step.model_dump(),
                 "page_features_received": [f.model_dump() for f in request.initial_page_features],
+                "page_features_filtered": [f.model_dump() for f in filtered_features],
+                "page_features_filtered_count": len(filtered_features),
                 "matched_feature": match["feature"].model_dump() if match["feature"] else None,
                 "match_confidence": match["confidence"],
                 "match_method": match_method,
@@ -362,7 +459,6 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
     last_seen_url = str(session_doc.get("last_seen_url") or "")
     last_seen_sig = str(session_doc.get("last_seen_sig") or "")
 
-    # Update seen markers (we still use previous values below for change detection).
     if request.url:
         await db.sessions.update_one(
             {"session_id": request.session_id},
@@ -375,13 +471,9 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
             },
         )
 
-    # NOTE: legacy full-plan "replan on domain change" removed.
-
-    # Only advance if the client reports success for the last action we sent.
     if request.previous_action_result.success and last_sent == current_step_number:
         current_step_number += 1
 
-    # Force advance: used by the UI "Next step" manual button.
     if request.force_advance:
         current_step_number = max(current_step_number, last_sent) + 1
 
@@ -390,43 +482,47 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
     target_domain = session_doc.get("target_domain")
     target_url = session_doc.get("target_url")
 
-    # If we are in single_step mode and the user is still on the wrong domain, keep returning a manual WAIT step.
+    # If we are in single_step mode and the user is still on the wrong domain
     if (
         mode == "single_step"
         and target_domain
         and request.url
         and not request.force_advance
-        and not _domain_matches(target_domain, _domain_from_url(request.url))
     ):
-        url_line = target_url or f"https://{target_domain}/"
-        step = PlannedStep(
-            step_number=current_step_number,
-            action="WAIT",
-            description=(
-                "Open a new tab, click the address bar, paste this URL, and press Enter:\n"
-                f"{url_line}"
-            ),
-            target_hints=TargetHints(),
-            expected_page_change=True,
-        )
-        await db.sessions.update_one(
-            {"session_id": request.session_id},
-            {"$set": {"current_step_number": current_step_number, "last_sent_step_number": current_step_number, "updated_at": now}},
-        )
-        return NextActionResponse(
-            step_number=step.step_number,
-            total_steps=step.step_number,
-            action=step.action,
-            target_feature_index=None,
-            target_feature=None,
-            instruction=_instruction_for_step(step),
-            text_input=None,
-            confidence=1.0,
-            expected_page_change=True,
-            session_complete=False,
-        )
+        target_brand = _brand_key(target_domain)
+        
+        # Simple check: does the target brand appear in the current URL?
+        user_on_correct_site = target_brand and target_brand in request.url.lower()
+        
+        if not user_on_correct_site:
+            url_line = target_url or f"https://{target_domain}/"
+            step = PlannedStep(
+                step_number=current_step_number,
+                action="WAIT",
+                description=(
+                    "Open a new tab, click the address bar, paste this URL, and press Enter:\n"
+                    f"{url_line}"
+                ),
+                target_hints=TargetHints(),
+                expected_page_change=True,
+            )
+            await db.sessions.update_one(
+                {"session_id": request.session_id},
+                {"$set": {"current_step_number": current_step_number, "last_sent_step_number": current_step_number, "updated_at": now}},
+            )
+            return NextActionResponse(
+                step_number=step.step_number,
+                total_steps=step.step_number,
+                action=step.action,
+                target_feature_index=None,
+                target_feature=None,
+                instruction=_instruction_for_step(step),
+                text_input=None,
+                confidence=1.0,
+                expected_page_change=True,
+                session_complete=False,
+            )
 
-    # In single_step mode, we never "run out" of steps; we keep generating.
     if mode != "single_step" and current_step_number > total_steps:
         await db.sessions.update_one(
             {"session_id": request.session_id},
@@ -447,7 +543,6 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
 
     step = _step_from_session(session_doc, current_step_number)
     if mode == "single_step" and (step is None):
-        # Generate the next step on-demand and append it to planned_steps
         try:
             new_step = await select_next_step(
                 step_number=current_step_number,
@@ -478,7 +573,9 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
     elif not step:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Current step not found")
 
-    # Default no-target actions
+    # Initialize filtered_features for logging
+    filtered_features: List[PageFeature] = []
+
     if step.action in {"SCROLL", "WAIT"}:
         match = {"matched": True, "feature_index": None, "confidence": 1.0, "feature": None}
         match_method = "algorithm"
@@ -507,19 +604,31 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
             session_complete=True,
         )
     else:
-        match = match_element_to_step(step, request.page_features)
+        # Filter features by relevance before matching
+        filtered_features = filter_features_by_relevance(
+            page_features=request.page_features,
+            current_step=step,
+            goal=canonical_goal,
+            min_confidence=0.3,
+            max_features=50,
+        )
+
+        logger.info(
+            f"[next_action] Step {step.step_number}: Filtered {len(request.page_features)} -> {len(filtered_features)} features"
+        )
+
+        match = match_element_to_step(step, filtered_features)
         match_method = "algorithm"
         if not match["matched"]:
             try:
-                match = await fallback_to_gemini(step, request.page_features)
+                match = await fallback_to_gemini(step, filtered_features)
                 match_method = "gemini_fallback"
             except MatcherError as e:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Gemini matcher error: {e}"
                 ) from e
 
-        # Adaptive behavior: if we can't match the current step to the current DOM,
-        # and the page/DOM has changed since we last saw it, re-plan from the current page.
+        # Adaptive behavior for re-planning
         if mode != "single_step" and (not match.get("matched", False)) and request.url:
             curr_sig = _features_signature(request.page_features)
             url_changed = bool(last_seen_url and request.url and request.url != last_seen_url)
@@ -570,9 +679,17 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
                             session_complete=True,
                         )
                     else:
-                        match = match_element_to_step(step, request.page_features)
+                        # Re-filter for new step
+                        filtered_features = filter_features_by_relevance(
+                            page_features=request.page_features,
+                            current_step=step,
+                            goal=canonical_goal,
+                            min_confidence=0.3,
+                            max_features=50,
+                        )
+                        match = match_element_to_step(step, filtered_features)
                         if not match["matched"]:
-                            match = await fallback_to_gemini(step, request.page_features)
+                            match = await fallback_to_gemini(step, filtered_features)
 
                     return NextActionResponse(
                         step_number=step.step_number,
@@ -595,6 +712,8 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
                 "step_number": step.step_number,
                 "planned_action": step.model_dump(),
                 "page_features_received": [f.model_dump() for f in request.page_features],
+                "page_features_filtered": [f.model_dump() for f in filtered_features] if filtered_features else [],
+                "page_features_filtered_count": len(filtered_features) if filtered_features else 0,
                 "matched_feature": match["feature"].model_dump() if match["feature"] else None,
                 "match_confidence": match["confidence"],
                 "match_method": match_method,
@@ -651,7 +770,6 @@ async def handle_correction(request: CorrectionRequest, db: AsyncIOMotorDatabase
         if request.actual_feature_index is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="actual_feature_index required")
 
-        # Find the most recent execution log entry for this step to locate the feature data.
         log_entry = await db.execution_log.find_one(
             {"session_id": request.session_id, "step_number": step_number},
             sort=[("timestamp", -1)],
@@ -677,7 +795,6 @@ async def handle_correction(request: CorrectionRequest, db: AsyncIOMotorDatabase
             {"$set": {"planned_steps": new_steps, "updated_at": now}},
         )
 
-        # Update log entry with feedback + actual clicked
         await db.execution_log.update_one(
             {"_id": log_entry["_id"]},
             {"$set": {"user_feedback": "wrong_element", "actual_feature_clicked": actual.model_dump()}},
@@ -685,7 +802,6 @@ async def handle_correction(request: CorrectionRequest, db: AsyncIOMotorDatabase
 
         return {"ok": True, "step_number": step_number, "updated_target_hints": updated_hints.model_dump()}
 
-    # doesn't_work: just log it for now
     now = _utcnow()
     await db.execution_log.insert_one(
         {
@@ -720,4 +836,3 @@ async def session_status(session_id: str, db: AsyncIOMotorDatabase = Depends(get
         url=session_doc.get("url", ""),
         updated_at=session_doc.get("updated_at") or _utcnow(),
     )
-

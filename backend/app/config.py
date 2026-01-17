@@ -32,7 +32,7 @@ if BaseSettings is not None:
         log_level: str = "INFO"
         
         # Rate limiting settings
-        llm_min_delay: float = 1.0   # Min seconds between LLM calls
+        llm_min_delay: float = 0.2   # Min seconds between LLM calls (lower = faster, higher = safer)
         llm_max_retries: int = 3     # Max retries on rate limit
         llm_initial_backoff: float = 2.0   # Initial backoff seconds
         llm_max_backoff: float = 30.0      # Max backoff seconds
@@ -51,7 +51,7 @@ else:
             self.log_level = os.getenv("LOG_LEVEL", "INFO")
             
             # Rate limiting settings
-            self.llm_min_delay = float(os.getenv("LLM_MIN_DELAY", "1.0"))
+            self.llm_min_delay = float(os.getenv("LLM_MIN_DELAY", "0.2"))
             self.llm_max_retries = int(os.getenv("LLM_MAX_RETRIES", "3"))
             self.llm_initial_backoff = float(os.getenv("LLM_INITIAL_BACKOFF", "2.0"))
             self.llm_max_backoff = float(os.getenv("LLM_MAX_BACKOFF", "30.0"))

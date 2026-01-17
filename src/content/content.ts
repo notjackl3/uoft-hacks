@@ -10,7 +10,19 @@ let highlightOverlayRAF: number | null = null;
 let currentHighlightedEl: HTMLElement | null = null;
 
 function ensureHighlightOverlay(): HTMLDivElement {
+  // If this content script has been injected multiple times, the DOM can end up with
+  // multiple overlays. Enforce a single overlay element.
+  const existing = Array.from(document.querySelectorAll('#bb-highlight-overlay')) as HTMLDivElement[];
+  if (existing.length) {
+    // Keep the last one (most recently appended), remove the rest.
+    const keep = existing[existing.length - 1];
+    for (let i = 0; i < existing.length - 1; i++) existing[i].remove();
+    highlightOverlay = keep;
+    return keep;
+  }
+
   if (highlightOverlay && document.documentElement.contains(highlightOverlay)) return highlightOverlay;
+
   const el = document.createElement('div');
   el.id = 'bb-highlight-overlay';
   el.style.cssText = `
@@ -58,7 +70,10 @@ function stopOverlayTracking() {
   if (highlightOverlayRAF) window.cancelAnimationFrame(highlightOverlayRAF);
   highlightOverlayRAF = null;
   currentHighlightedEl = null;
-  if (highlightOverlay) highlightOverlay.style.display = 'none';
+  // Hide any lingering overlays (in case of multiple injections)
+  for (const el of Array.from(document.querySelectorAll('#bb-highlight-overlay')) as HTMLDivElement[]) {
+    el.style.display = 'none';
+  }
 }
 
 // Listen for messages from the side panel (via background script)
@@ -127,6 +142,9 @@ function extractPageFeatures(options?: {
   keywords?: string[];
   limit?: number;
 }): ContentResponse {
+  elementCache.clear();
+  selectorCounter = 0;
+
   const pageTitle = document.title;
   const pageUrl = window.location.href;
 
@@ -548,31 +566,16 @@ async function highlightElementByIndex(payload: {
  * Highlight an element visually
  */
 function highlightElement(element: HTMLElement, duration: number = 3000): void {
-  // Store original styles if not already tracked
-  if (!highlightedElements.has(element)) {
-    highlightedElements.set(element, {
-      outline: element.style.outline,
-      boxShadow: element.style.boxShadow,
-    });
-  }
+  // Single-highlight policy: use ONLY the overlay rectangle.
+  // Do not apply outline/box-shadow directly to DOM elements (prevents stacked borders).
+  ensureHighlightOverlay();
 
-  // Use !important to override sites that set `outline: none !important` etc.
-  element.style.setProperty('outline', '3px solid #ff0000', 'important');
-  element.style.setProperty('outline-offset', '2px', 'important');
-  element.style.setProperty('box-shadow', '0 0 0 4px rgba(255, 0, 0, 0.35)', 'important');
-  
   // duration <= 0 means "sticky" highlight (until next highlight / clearAllHighlights).
   if (duration > 0) {
     setTimeout(() => {
-      const original = highlightedElements.get(element);
-      if (original) {
-        // Clear the forced properties first, then restore originals.
-        element.style.removeProperty('outline');
-        element.style.removeProperty('outline-offset');
-        element.style.removeProperty('box-shadow');
-        element.style.outline = original.outline;
-        element.style.boxShadow = original.boxShadow;
-        highlightedElements.delete(element);
+      // Only clear if we are still tracking this element.
+      if (currentHighlightedEl === element) {
+        stopOverlayTracking();
       }
     }, duration);
   }
@@ -620,22 +623,47 @@ async function waitForEvent(payload: {
 }): Promise<ContentResponse> {
   const { event, targetIndex = null, selector, timeoutMs = 30000 } = payload || {};
 
-  // scroll is global
-  if (event === 'scroll') {
+  // For click events, listen on document and check if target matches
+  if (event === 'click') {
     return new Promise((resolve) => {
       let done = false;
-      const onScroll = () => {
+      
+      const onClick = (e: MouseEvent) => {
         if (done) return;
-        done = true;
-        window.removeEventListener('scroll', onScroll, true);
-        resolve({ success: true, message: 'Detected scroll' });
+        
+        // Get the clicked element and check if it matches our target
+        const clickedEl = e.target as HTMLElement;
+        let targetEl: HTMLElement | null = null;
+        
+        if (selector) {
+          targetEl = getElementBySelector(selector);
+        } else if (targetIndex !== null) {
+          const { features } = extractPageFeatures();
+          const feature = features?.find((f) => f.index === targetIndex);
+          if (feature) targetEl = getElementBySelector(feature.selector);
+        }
+        
+        // Check if clicked element IS or CONTAINS the target, or target contains clicked
+        const isMatch = targetEl && (
+          clickedEl === targetEl ||
+          targetEl.contains(clickedEl) ||
+          clickedEl.contains(targetEl)
+        );
+        
+        if (isMatch) {
+          done = true;
+          document.removeEventListener('click', onClick, true);
+          resolve({ success: true, message: 'Detected click on target' });
+        }
       };
-      window.addEventListener('scroll', onScroll, true);
+      
+      document.addEventListener('click', onClick, true);
+      
       setTimeout(() => {
         if (done) return;
         done = true;
-        window.removeEventListener('scroll', onScroll, true);
-        resolve({ success: false, error: 'Timed out waiting for scroll' });
+        document.removeEventListener('click', onClick, true);
+        resolve({ success: false, error: 'Timed out waiting for click' });
       }, timeoutMs);
     });
   }
@@ -662,20 +690,20 @@ async function waitForEvent(payload: {
     const finish = (ok: boolean, msg: string) => {
       if (done) return;
       done = true;
-      element.removeEventListener('click', onClick, true);
       element.removeEventListener('input', onInput, true);
       element.removeEventListener('change', onInput, true);
+      window.removeEventListener('scroll', onScroll, true);
       resolve(ok ? { success: true, message: msg } : { success: false, error: msg });
     };
 
-    const onClick = () => finish(true, 'Detected click');
     const onInput = () => finish(true, 'Detected input');
+    const onScroll = () => finish(true, 'Detected scroll');
 
-    if (event === 'click') {
-      element.addEventListener('click', onClick, true);
-    } else if (event === 'input') {
+    if (event === 'input') {
       element.addEventListener('input', onInput, true);
       element.addEventListener('change', onInput, true);
+    } else if (event === 'scroll') {
+      window.addEventListener('scroll', onScroll, true);
     } else {
       return finish(false, `Unknown event: ${event}`);
     }

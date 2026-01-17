@@ -1,9 +1,12 @@
+#
+# backend/app/services/matcher.py
+
 from __future__ import annotations
 
 import logging
 import re
 import string
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from app.config import settings
 from app.models import PageFeature, PlannedStep
@@ -24,6 +27,13 @@ WEIGHTS = {
     "role": 15,
     "selector": 10,
 }
+
+# Minimum confidence threshold to keep a feature
+MIN_CONFIDENCE_THRESHOLD = 0.3
+
+# Maximum features to keep after filtering
+MAX_FILTERED_FEATURES = 50
+
 
 def _filter_features_for_step(current_step: PlannedStep, page_features: List[PageFeature]) -> List[PageFeature]:
     """
@@ -69,6 +79,7 @@ def _selector_matches(selector: str, pattern: Optional[str]) -> bool:
         # Treat invalid regex as plain substring
         return normalize_text(pattern) in normalize_text(selector)
 
+
 _STOPWORDS = {
     "click",
     "press",
@@ -112,20 +123,27 @@ def _keywords_from_step_description(desc: Optional[str]) -> List[str]:
     return out[:5]
 
 
-def match_element_to_step(current_step: PlannedStep, page_features: List[PageFeature]) -> Dict:
-    """
-    Match planned step to actual page feature using a simple weighted scoring algorithm.
-    This does NOT call any LLM - it's purely algorithmic.
-    """
-    page_features = _filter_features_for_step(current_step, page_features)
-    target_hints = current_step.target_hints
-    implied_text = _keywords_from_step_description(current_step.description) if not target_hints.text_contains else []
-    best: Dict = {"matched": False, "feature_index": None, "confidence": 0.0, "feature": None}
-    best_conf = 0.0
+def _keywords_from_goal(goal: Optional[str]) -> List[str]:
+    """Extract keywords from the user's goal for relevance scoring."""
+    return _keywords_from_step_description(goal)
 
-    for feature in page_features:
-        score = 0
-        max_score = 0
+
+def _score_feature(
+    feature: PageFeature,
+    current_step: Optional[PlannedStep] = None,
+    goal_keywords: Optional[List[str]] = None,
+) -> float:
+    """
+    Score a single feature based on how relevant it is to the current step and/or goal.
+    Returns a confidence score between 0.0 and 1.0.
+    """
+    score = 0.0
+    max_score = 0.0
+
+    # If we have a step with target hints, use those
+    if current_step:
+        target_hints = current_step.target_hints
+        implied_text = _keywords_from_step_description(current_step.description) if not target_hints.text_contains else []
 
         # Type match
         if target_hints.type:
@@ -147,10 +165,10 @@ def match_element_to_step(current_step: PlannedStep, page_features: List[PageFea
             if _contains_any(feature.placeholder or "", target_hints.placeholder_contains):
                 score += WEIGHTS["placeholder"]
 
-        # Role / aria-label (we only have aria_label in feature)
+        # Role / aria-label
         if target_hints.role:
             max_score += WEIGHTS["role"]
-            if normalize_text(target_hints.role) in normalize_text(feature.aria_label):
+            if normalize_text(target_hints.role) in normalize_text(feature.aria_label or ""):
                 score += WEIGHTS["role"]
 
         # Selector pattern
@@ -159,11 +177,118 @@ def match_element_to_step(current_step: PlannedStep, page_features: List[PageFea
             if _selector_matches(feature.selector, target_hints.selector_pattern):
                 score += WEIGHTS["selector"]
 
-        confidence = (score / max_score) if max_score > 0 else 0.0
+    # If we have goal keywords, also check against those
+    if goal_keywords:
+        keyword_weight = 20
+        max_score += keyword_weight
+        combined = f"{feature.text or ''} {feature.aria_label or ''} {feature.placeholder or ''}"
+        if _contains_any(combined, goal_keywords):
+            score += keyword_weight
+
+    # FIX: Handle case where no hints/keywords are provided
+    # Give a base score based on feature type (some types are more interactive than others)
+    if max_score == 0:
+        # No specific matching criteria - assign base relevance by type
+        type_base_scores = {
+            "input": 0.6,   # Inputs are usually important
+            "button": 0.5,  # Buttons are actionable
+            "link": 0.4,    # Links are common but often navigation
+        }
+        return type_base_scores.get(feature.type, 0.3)
+
+    return score / max_score
+
+
+def filter_features_by_relevance(
+    page_features: List[PageFeature],
+    current_step: Optional[PlannedStep] = None,
+    goal: Optional[str] = None,
+    min_confidence: float = MIN_CONFIDENCE_THRESHOLD,
+    max_features: int = MAX_FILTERED_FEATURES,
+) -> List[PageFeature]:
+    """
+    Filter and rank page features by relevance to the current step and/or goal.
+    
+    - Scores each feature
+    - Drops features below min_confidence threshold
+    - Keeps up to max_features, sorted by confidence (highest first)
+    - Re-indexes features to maintain consecutive indices
+    
+    Returns filtered list of PageFeature objects.
+    """
+    if not page_features:
+        return []
+
+    # First, filter by action type if we have a step
+    if current_step:
+        page_features = _filter_features_for_step(current_step, page_features)
+
+    # Extract goal keywords for additional relevance scoring
+    goal_keywords = _keywords_from_goal(goal) if goal else []
+
+    # Score all features
+    scored_features: List[Tuple[PageFeature, float]] = []
+    for feature in page_features:
+        confidence = _score_feature(feature, current_step, goal_keywords)
+        scored_features.append((feature, confidence))
+
+    # Sort by confidence (highest first)
+    scored_features.sort(key=lambda x: x[1], reverse=True)
+
+    # Filter by minimum confidence, but always keep at least some features
+    # if we have any (in case nothing meets threshold)
+    filtered = [(f, c) for f, c in scored_features if c >= min_confidence]
+    
+    # If nothing meets threshold, keep top 10 anyway (fallback)
+    if not filtered and scored_features:
+        filtered = scored_features[:10]
+        logger.warning(
+            f"No features met confidence threshold {min_confidence}. "
+            f"Keeping top {len(filtered)} features as fallback."
+        )
+
+    # Limit to max_features
+    filtered = filtered[:max_features]
+
+    # Re-index features to maintain consecutive indices
+    result: List[PageFeature] = []
+    for new_index, (feature, confidence) in enumerate(filtered):
+        # Create a copy with updated index
+        updated_feature = feature.model_copy(update={"index": new_index})
+        result.append(updated_feature)
+        
+        # Log for debugging
+        logger.debug(
+            f"Feature {new_index}: type={feature.type}, "
+            f"text='{(feature.text or '')[:30]}', confidence={confidence:.2f}"
+        )
+
+    logger.info(
+        f"Filtered features: {len(page_features)} -> {len(result)} "
+        f"(threshold={min_confidence}, max={max_features})"
+    )
+
+    return result
+
+
+def match_element_to_step(current_step: PlannedStep, page_features: List[PageFeature]) -> Dict:
+    """
+    Match planned step to actual page feature using a simple weighted scoring algorithm.
+    This does NOT call any LLM - it's purely algorithmic.
+    """
+    page_features = _filter_features_for_step(current_step, page_features)
+    target_hints = current_step.target_hints
+    implied_text = _keywords_from_step_description(current_step.description) if not target_hints.text_contains else []
+    best: Dict = {"matched": False, "feature_index": None, "confidence": 0.0, "feature": None}
+    best_conf = 0.0
+
+    for feature in page_features:
+        confidence = _score_feature(feature, current_step, None)
+        
         if confidence > best_conf:
             best_conf = confidence
             best = {
-                "matched": confidence > 0.5,
+                "matched": confidence > 0.65,
                 "feature_index": feature.index,
                 "confidence": float(confidence),
                 "feature": feature,
@@ -184,7 +309,10 @@ def _call_openai_matcher_sync(prompt: str) -> str:
         messages=[
             {"role": "user", "content": prompt}
         ],
-        temperature=0.3,  # Lower temperature for more deterministic matching
+        # Matching should be as deterministic as possible.
+        temperature=0.0,
+        max_tokens=120,
+        response_format={"type": "json_object"},
     )
     return response.choices[0].message.content or ""
 

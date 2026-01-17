@@ -118,7 +118,10 @@ def _call_openai_sync(prompt: str) -> str:
         messages=[
             {"role": "user", "content": prompt}
         ],
-        temperature=0.2,
+        # Deterministic + faster: keep output small and enforce JSON mode.
+        temperature=0.1,
+        max_tokens=1200,
+        response_format={"type": "json_object"},
     )
     return response.choices[0].message.content or ""
 

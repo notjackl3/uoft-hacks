@@ -561,7 +561,7 @@ const SidePanel: React.FC = () => {
     setStatus('acting');
     const steps = currentSession.plannedSteps;
     // IMPORTANT: start false so backend doesn't advance to step 2 before the user completes step 1.
-    let previousSuccess = false;
+    let previousSuccess = true;
     let previousError: string | undefined = undefined;
 
     const keywordsFromInstruction = (s: string): string[] => {
@@ -820,9 +820,7 @@ const SidePanel: React.FC = () => {
         await sendMessageToContent({
           type: 'HIGHLIGHT_ELEMENT',
           payload: {
-            targetIndex: nextAction.target_feature_index ?? undefined,
             selector: nextAction.target_feature?.selector,
-            // Keep the highlight until the next step (or until we clear highlights).
             duration: 0,
           },
           target: 'content',
@@ -832,6 +830,13 @@ const SidePanel: React.FC = () => {
         // Wait a moment for user to see the highlight
         await delay(1200);
         if (myRunId !== executionRunIdRef.current) return;
+
+        const freshFeatures = await getFeaturesSafe();
+        const freshMatch = (freshFeatures.features as PageFeature[])?.find(f => 
+          f.text === nextAction.target_feature?.text && 
+          f.type === nextAction.target_feature?.type
+        );
+        const selectorToWatch = freshMatch?.selector || nextAction.target_feature?.selector;
 
         // Guidance-only: user performs the action. We just wait for the event.
         if (action === 'CLICK') {
@@ -848,10 +853,9 @@ const SidePanel: React.FC = () => {
             }
             const waited = await sendMessageToContent({
               type: 'WAIT_FOR_EVENT',
-          payload: {
+              payload: {
                 event: 'click',
-            targetIndex: nextAction.target_feature_index,
-                selector: nextAction.target_feature?.selector,
+                selector: selectorToWatch,
                 timeoutMs: 2500,
           },
           target: 'content',
