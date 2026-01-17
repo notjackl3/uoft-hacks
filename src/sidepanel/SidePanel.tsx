@@ -20,6 +20,8 @@ const SidePanel: React.FC = () => {
   const [session, setSession] = useState<SessionState | null>(null);
   const [backendAvailable, setBackendAvailable] = useState<boolean | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const manualAdvanceRef = useRef<boolean>(false);
+  const manualAdvanceNoteRef = useRef<string>('');
 
   // Auto-scroll to bottom when messages change
   useEffect(() => {
@@ -224,6 +226,13 @@ const SidePanel: React.FC = () => {
     }
 
     const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const consumeManualAdvance = (): { advanced: boolean; note?: string } => {
+      if (!manualAdvanceRef.current) return { advanced: false };
+      manualAdvanceRef.current = false;
+      const note = manualAdvanceNoteRef.current;
+      manualAdvanceNoteRef.current = '';
+      return { advanced: true, note };
+    };
 
     const getFeaturesSafe = async (): Promise<ContentResponse> => {
       // Navigation can temporarily unload the content script; retry a few times.
@@ -305,19 +314,77 @@ const SidePanel: React.FC = () => {
 
     setStatus('acting');
     const steps = currentSession.plannedSteps;
-    let previousSuccess = true;
+    // IMPORTANT: start false so backend doesn't advance to step 2 before the user completes step 1.
+    let previousSuccess = false;
     let previousError: string | undefined = undefined;
 
     try {
-      // Drive execution off the backend `/next` so step order stays in sync even with WAIT/SCROLL.
+      const waitForManualPageChange = async (opts: {
+        prevUrl: string;
+        prevSig: string;
+        timeoutMs: number;
+        remindEveryMs: number;
+      }): Promise<boolean> => {
+        const start = Date.now();
+        let lastRemind = 0;
+        while (Date.now() - start < opts.timeoutMs) {
+          const manual = consumeManualAdvance();
+          if (manual.advanced) return true;
+          await delay(1000);
+          const resp = await getFeaturesSafe();
+          const newUrl = resp.pageUrl || '';
+          const newSig = resp.features ? featuresSignature(resp.features as PageFeature[]) : '';
+          const urlChanged = Boolean(opts.prevUrl && newUrl && newUrl !== opts.prevUrl);
+          const domChanged = Boolean(newSig && newSig !== opts.prevSig);
+
+          if (urlChanged || domChanged) return true;
+
+          if (Date.now() - lastRemind >= opts.remindEveryMs) {
+            lastRemind = Date.now();
+            addAgentMessage('⏳ Still waiting — please complete the step above.');
+          }
+        }
+        return false;
+      };
+
+      // Drive execution off the backend `/next` so step order stays in sync.
       for (let guard = 0; guard < 200; guard++) {
         // Get current page features (fresh DOM)
         const featuresResponse: ContentResponse = await getFeaturesSafe();
         if (!featuresResponse.features) {
           throw new Error(featuresResponse.error || 'Failed to get page features');
         }
+
+        // Debug: log what the extension sees from the page (open the Side Panel DevTools console)
+        try {
+          console.groupCollapsed(
+            '[Big Brother][SidePanel] GET_FEATURES',
+            featuresResponse.pageUrl || window.location.href
+          );
+          console.table(
+            (featuresResponse.features as PageFeature[]).slice(0, 30).map((f) => ({
+              index: f.index,
+              type: f.type,
+              text: f.text,
+              placeholder: f.placeholder || '',
+              aria_label: f.aria_label || '',
+              href: f.href || '',
+              selector: f.selector,
+            }))
+          );
+          console.groupEnd();
+        } catch {
+          // ignore console.table issues
+        }
         const prevUrl = featuresResponse.pageUrl || window.location.href;
         const prevSig = featuresSignature(featuresResponse.features as PageFeature[]);
+
+        // Manual override: if user pressed "Next step", treat previous step as complete.
+        const manualBeforeNext = consumeManualAdvance();
+        if (manualBeforeNext.advanced) {
+          previousSuccess = true;
+          previousError = manualBeforeNext.note || 'Manual advance';
+        }
 
         // Ask backend what the next step is (backend advances only when previousSuccess=true)
         const nextAction = await getNextAction({
@@ -359,36 +426,35 @@ const SidePanel: React.FC = () => {
             : null
         );
 
-        // No-element actions
+        // Guidance-only: SCROLL is manual.
         if (action === 'SCROLL') {
-          const result = await sendMessageToContent({
-            type: 'EXECUTE_ACTION',
-            payload: {
-              action,
-              targetIndex: null,
-            },
-            target: 'content',
-          });
-
-          if (!result.success) {
-            addAgentMessage(`⚠️ Action failed: ${result.error}`);
+          addAgentMessage('Please scroll down a bit on the page.');
+          let detected = false;
+          for (let i = 0; i < 12; i++) {
+            const manual = consumeManualAdvance();
+            if (manual.advanced) {
+              detected = true;
+              break;
+            }
+            const waited = await sendMessageToContent({
+              type: 'WAIT_FOR_EVENT',
+              payload: { event: 'scroll', timeoutMs: 2500 },
+              target: 'content',
+            });
+            if (waited.success) {
+              detected = true;
+              break;
+            }
+          }
+          if (!detected) {
+            addAgentMessage(`⚠️ I didn't detect scrolling yet. You can scroll again, or press **Next step** if you already did it.`);
             previousSuccess = false;
-            previousError = result.error;
-            await delay(1000);
+            previousError = 'No scroll detected';
+            await delay(3000);
             continue;
           }
-
-          addAgentMessage(`✅ ${result.message || 'Action completed.'}`);
           previousSuccess = true;
           previousError = undefined;
-          // Wait for DOM to settle before moving on (SPA / lazy loads)
-          await waitForPageUpdate({
-            prevUrl,
-            prevSig,
-            expectUrlChange: expectChange,
-            timeoutMs: expectChange ? 20000 : 6000,
-          });
-
           continue;
         }
 
@@ -401,29 +467,30 @@ const SidePanel: React.FC = () => {
               ? '⏳ Waiting for you to finish this step and for the page to update...'
               : '⏳ Waiting...'
           );
-
-          const updated = await waitForPageUpdate({
-            prevUrl,
-            prevSig,
-            expectUrlChange: expectChange,
-            timeoutMs: expectChange ? 60000 : 6000,
-          });
-
-          const newUrl = updated.pageUrl || '';
-          const urlChanged = Boolean(prevUrl && newUrl && newUrl !== prevUrl);
-          const domChanged =
-            Boolean(updated.features) &&
-            featuresSignature(updated.features as PageFeature[]) !== prevSig;
-
-          if (expectChange && !(urlChanged || domChanged)) {
-            addAgentMessage(
-              '⚠️ I didn’t detect the page changing. Please follow the instruction above (open a new tab / type the URL / press Enter). If you end up on a different site, tell me and I’ll adapt.'
-            );
-            previousSuccess = false;
-            previousError = 'No page change detected after manual WAIT step';
-            continue;
+          if (expectChange) {
+            const changed = await waitForManualPageChange({
+              prevUrl,
+              prevSig,
+              timeoutMs: 60000,
+              remindEveryMs: 15000,
+            });
+            if (!changed) {
+              addAgentMessage(
+                '⚠️ I still didn’t detect the page changing. Please do the step above. If you went to the wrong site, go back and open:\nhttps://www.instagram.com/accounts/emailsignup/'
+              );
+              previousSuccess = false;
+              previousError = 'No page change detected after manual WAIT step';
+              await delay(5000);
+              continue;
+            }
+          } else {
+            // Short wait, but still allow manual override.
+            for (let i = 0; i < 2; i++) {
+              const manual = consumeManualAdvance();
+              if (manual.advanced) break;
+              await delay(1000);
+            }
           }
-
           previousSuccess = true;
           previousError = undefined;
           continue;
@@ -452,7 +519,8 @@ const SidePanel: React.FC = () => {
           type: 'HIGHLIGHT_ELEMENT',
           payload: {
             targetIndex: nextAction.target_feature_index,
-            duration: 3000,
+            // Keep the highlight until the next step (or until we clear highlights).
+            duration: 0,
           },
           target: 'content',
         });
@@ -460,40 +528,97 @@ const SidePanel: React.FC = () => {
         // Wait a moment for user to see the highlight
         await delay(1200);
 
-        // Execute the action
-        const actionResult = await sendMessageToContent({
-          type: 'EXECUTE_ACTION',
-          payload: {
-            action: action as 'CLICK' | 'TYPE' | 'SCROLL' | 'WAIT',
-            targetIndex: nextAction.target_feature_index,
-            textInput,
-          },
-          target: 'content',
-        });
-
-        if (!actionResult.success) {
-          addAgentMessage(`⚠️ Action failed: ${actionResult.error}`);
-          previousSuccess = false;
-          previousError = actionResult.error;
-          // Do NOT advance; keep the same step and re-scan the page.
-          // This prevents running ahead on stale DOM and allows retry/correction.
-          await delay(1000);
-          continue;
-        } else {
-          addAgentMessage(`✅ ${actionResult.message || 'Action completed.'}`);
+        // Guidance-only: user performs the action. We just wait for the event.
+        if (action === 'CLICK') {
+          addAgentMessage('Now please click the highlighted element.');
+          let detected = false;
+          let manualUsedThisStep = false;
+          for (let i = 0; i < 12; i++) {
+            const manual = consumeManualAdvance();
+            if (manual.advanced) {
+              detected = true;
+              manualUsedThisStep = true;
+              break;
+            }
+            const waited = await sendMessageToContent({
+              type: 'WAIT_FOR_EVENT',
+              payload: { event: 'click', targetIndex: nextAction.target_feature_index, timeoutMs: 2500 },
+              target: 'content',
+            });
+            if (waited.success) {
+              detected = true;
+              break;
+            }
+          }
+          if (!detected) {
+            addAgentMessage(`⚠️ I didn't detect a click yet. Try clicking again, or press **Next step** if you already did it.`);
+            previousSuccess = false;
+            previousError = 'No click detected';
+            await delay(3000);
+            continue;
+          }
           previousSuccess = true;
           previousError = undefined;
+
+          // If user manually advanced, don't hang waiting for a page change forever.
+          if (expectChange) {
+            await waitForPageUpdate({
+              prevUrl,
+              prevSig,
+              expectUrlChange: true,
+              timeoutMs: manualUsedThisStep ? 5000 : 20000,
+            });
+          }
+        } else if (action === 'TYPE') {
+          addAgentMessage(
+            `Now please type this into the highlighted field:\n${textInput || '<TEXT>'}`
+          );
+          let detected = false;
+          let manualUsedThisStep = false;
+          for (let i = 0; i < 18; i++) {
+            const manual = consumeManualAdvance();
+            if (manual.advanced) {
+              detected = true;
+              manualUsedThisStep = true;
+              break;
+            }
+            const waited = await sendMessageToContent({
+              type: 'WAIT_FOR_EVENT',
+              payload: { event: 'input', targetIndex: nextAction.target_feature_index, timeoutMs: 2500 },
+              target: 'content',
+            });
+            if (waited.success) {
+              detected = true;
+              break;
+            }
+          }
+          if (!detected) {
+            addAgentMessage(`⚠️ I didn't detect typing yet. Type again, or press **Next step** if you already did it.`);
+            previousSuccess = false;
+            previousError = 'No input detected';
+            await delay(3000);
+            continue;
+          }
+          previousSuccess = true;
+          previousError = undefined;
+
+          if (expectChange) {
+            await waitForPageUpdate({
+              prevUrl,
+              prevSig,
+              expectUrlChange: true,
+              timeoutMs: manualUsedThisStep ? 5000 : 20000,
+            });
+          }
         }
 
         // Wait for real completion: URL change when expected, otherwise DOM stabilization.
-        if (expectChange) {
-          addAgentMessage('⏳ Waiting for page navigation/DOM update...');
-        }
+        // (If we already waited above for expectChange on CLICK/TYPE, this becomes a quick settle.)
         await waitForPageUpdate({
           prevUrl,
           prevSig,
-          expectUrlChange: expectChange,
-          timeoutMs: expectChange ? 20000 : 6000,
+          expectUrlChange: false,
+          timeoutMs: 3000,
         });
 
       }
@@ -628,12 +753,27 @@ const SidePanel: React.FC = () => {
       <div className="bg-white border-b border-gray-200 px-4 py-3 shadow-sm">
         <div className="flex items-center justify-between">
           <h1 className="text-xl font-bold text-gray-800">Big Bro</h1>
-          <button
-            onClick={clearHistory}
-            className="text-sm text-gray-600 hover:text-gray-800 px-3 py-1 rounded hover:bg-gray-100 transition-colors"
-          >
-            Clear
-          </button>
+          <div className="flex items-center gap-2">
+            {session?.isExecuting && (
+              <button
+                onClick={() => {
+                  manualAdvanceRef.current = true;
+                  manualAdvanceNoteRef.current = 'Manual advance button pressed';
+                  addAgentMessage('➡️ Manual advance requested. Moving to the next step.');
+                }}
+                className="text-sm text-white bg-orange-500 hover:bg-orange-600 px-3 py-1 rounded transition-colors"
+                title="If the app didn't detect your click/typing, press this to continue."
+              >
+                Next step
+              </button>
+            )}
+            <button
+              onClick={clearHistory}
+              className="text-sm text-gray-600 hover:text-gray-800 px-3 py-1 rounded hover:bg-gray-100 transition-colors"
+            >
+              Clear
+            </button>
+          </div>
         </div>
         
         {/* Status Indicator */}

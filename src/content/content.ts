@@ -46,6 +46,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'WAIT_FOR_EVENT') {
+    waitForEvent(message.payload)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
   // Legacy handler for USER_PROMPT (for backwards compatibility)
     if (message.type === 'USER_PROMPT') {
     const result = extractPageFeatures();
@@ -143,7 +150,27 @@ function extractPageFeatures(): ContentResponse {
     f.index = idx;
   });
 
-  console.log(`Extracted ${uniqueFeatures.length} features from page`);
+  // Debug log: what the agent can "see"
+  try {
+    console.groupCollapsed(
+      `[Big Brother] Extracted ${uniqueFeatures.length} interactive elements`,
+      pageUrl
+    );
+    console.table(
+      uniqueFeatures.map((f) => ({
+        index: f.index,
+        type: f.type,
+        text: f.text,
+        placeholder: f.placeholder || '',
+        aria_label: f.aria_label || '',
+        href: f.href || '',
+        selector: f.selector,
+      }))
+    );
+    console.groupEnd();
+  } catch {
+    console.log(`Extracted ${uniqueFeatures.length} features from page`);
+  }
 
   return {
     success: true,
@@ -374,11 +401,26 @@ async function highlightElementByIndex(payload: {
   const feature = features?.find((f) => f.index === targetIndex);
   
   if (!feature) {
+    console.warn('[Big Brother] HIGHLIGHT_ELEMENT: feature index not found', {
+      targetIndex,
+      availableCount: features?.length ?? 0,
+    });
     return { success: false, error: `Element with index ${targetIndex} not found` };
   }
   
+  console.log('[Big Brother] HIGHLIGHT_ELEMENT: resolving selector', {
+    targetIndex,
+    selector: feature.selector,
+    type: feature.type,
+    text: feature.text,
+  });
+
   const element = getElementBySelector(feature.selector);
   if (!element) {
+    console.warn('[Big Brother] HIGHLIGHT_ELEMENT: selector did not match any element', {
+      targetIndex,
+      selector: feature.selector,
+    });
     return { success: false, error: `Could not find element: ${feature.selector}` };
   }
   
@@ -412,19 +454,27 @@ function highlightElement(element: HTMLElement, duration: number = 3000): void {
       boxShadow: element.style.boxShadow,
     });
   }
+
+  // Use !important to override sites that set `outline: none !important` etc.
+  element.style.setProperty('outline', '3px solid #ff0000', 'important');
+  element.style.setProperty('outline-offset', '2px', 'important');
+  element.style.setProperty('box-shadow', '0 0 0 4px rgba(255, 0, 0, 0.35)', 'important');
   
-  element.style.outline = '3px solid #FF6B00';
-  element.style.boxShadow = '0 0 20px rgba(255, 107, 0, 0.6)';
-  
-  // Remove highlight after delay
-  setTimeout(() => {
-    const original = highlightedElements.get(element);
-    if (original) {
-      element.style.outline = original.outline;
-      element.style.boxShadow = original.boxShadow;
-      highlightedElements.delete(element);
-    }
-  }, duration);
+  // duration <= 0 means "sticky" highlight (until next highlight / clearAllHighlights).
+  if (duration > 0) {
+    setTimeout(() => {
+      const original = highlightedElements.get(element);
+      if (original) {
+        // Clear the forced properties first, then restore originals.
+        element.style.removeProperty('outline');
+        element.style.removeProperty('outline-offset');
+        element.style.removeProperty('box-shadow');
+        element.style.outline = original.outline;
+        element.style.boxShadow = original.boxShadow;
+        highlightedElements.delete(element);
+      }
+    }, duration);
+  }
 }
 
 /**
@@ -456,6 +506,79 @@ function movePointerToElement(element: HTMLElement): void {
   setTimeout(() => {
     pointer!.style.opacity = '0';
   }, 2500);
+}
+
+/**
+ * Wait for a user interaction (guidance-only mode).
+ */
+async function waitForEvent(payload: {
+  event: 'click' | 'input' | 'scroll';
+  targetIndex?: number | null;
+  timeoutMs?: number;
+}): Promise<ContentResponse> {
+  const { event, targetIndex = null, timeoutMs = 30000 } = payload || {};
+
+  // scroll is global
+  if (event === 'scroll') {
+    return new Promise((resolve) => {
+      let done = false;
+      const onScroll = () => {
+        if (done) return;
+        done = true;
+        window.removeEventListener('scroll', onScroll, true);
+        resolve({ success: true, message: 'Detected scroll' });
+      };
+      window.addEventListener('scroll', onScroll, true);
+      setTimeout(() => {
+        if (done) return;
+        done = true;
+        window.removeEventListener('scroll', onScroll, true);
+        resolve({ success: false, error: 'Timed out waiting for scroll' });
+      }, timeoutMs);
+    });
+  }
+
+  if (targetIndex === null) {
+    return { success: false, error: 'No targetIndex provided' };
+  }
+
+  // Re-extract features to get fresh selectors
+  const { features } = extractPageFeatures();
+  const feature = features?.find((f) => f.index === targetIndex);
+  if (!feature) {
+    return { success: false, error: `Element with index ${targetIndex} not found` };
+  }
+
+  const element = getElementBySelector(feature.selector);
+  if (!element) {
+    return { success: false, error: `Could not find element: ${feature.selector}` };
+  }
+
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (ok: boolean, msg: string) => {
+      if (done) return;
+      done = true;
+      element.removeEventListener('click', onClick, true);
+      element.removeEventListener('input', onInput, true);
+      element.removeEventListener('change', onInput, true);
+      resolve(ok ? { success: true, message: msg } : { success: false, error: msg });
+    };
+
+    const onClick = () => finish(true, 'Detected click');
+    const onInput = () => finish(true, 'Detected input');
+
+    if (event === 'click') {
+      element.addEventListener('click', onClick, true);
+    } else if (event === 'input') {
+      element.addEventListener('input', onInput, true);
+      element.addEventListener('change', onInput, true);
+    } else {
+      return finish(false, `Unknown event: ${event}`);
+    }
+
+    setTimeout(() => finish(false, `Timed out waiting for ${event}`), timeoutMs);
+  });
 }
 
 export { extractPageFeatures, executeAction, highlightElementByIndex, clearAllHighlights };

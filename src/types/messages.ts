@@ -64,6 +64,17 @@ export interface ClearHighlightsMessage extends ChromeMessage {
   target: 'content';
 }
 
+// Message to wait for a user interaction on the page (guidance-only mode)
+export interface WaitForEventMessage extends ChromeMessage {
+  type: 'WAIT_FOR_EVENT';
+  payload: {
+    event: 'click' | 'input' | 'scroll';
+    targetIndex?: number | null; // required for click/input; ignored for scroll
+    timeoutMs?: number;
+  };
+  target: 'content';
+}
+
 export interface PageFeature {
   index: number;
   type: 'input' | 'button' | 'link';

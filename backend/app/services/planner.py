@@ -49,10 +49,7 @@ CRITICAL RULES:
     1) Open a new tab
     2) Click the address bar
     3) Type the correct URL and press Enter
-  - When you tell the user to go to a URL, you MUST include the full URL on its own line (so it can be clicked), like:
-    https://www.instagram.com/accounts/emailsignup/
-  - Example for Instagram signup: tell them to go to:
-    https://www.instagram.com/accounts/emailsignup/
+  - When you tell the user to go to a URL, you MUST include the full URL on its own line, so the user can copy and paste the link to use, or press on it to get to the correct site.
 - Never propose creating/signing into accounts for unrelated services just because you're currently on their page (e.g., Google Account).
 - When you reach the correct site, use ELEMENTS_JSON to decide what to do:
   - If elements suggest the user is already logged in (e.g. "Log out", "Settings", profile/account links), plan steps to log out first.

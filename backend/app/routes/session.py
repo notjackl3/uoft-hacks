@@ -49,6 +49,24 @@ def _same_domain(a: str, b: str) -> bool:
     return _domain_from_url(a) != "" and _domain_from_url(a) == _domain_from_url(b)
 
 
+def _features_signature(features: List[PageFeature]) -> str:
+    # Small fingerprint to detect meaningful DOM/UI changes.
+    parts: List[str] = []
+    for f in (features or [])[:30]:
+        parts.append(
+            "|".join(
+                [
+                    f.type,
+                    (f.text or "")[:50],
+                    (f.placeholder or "")[:30],
+                    (f.aria_label or "")[:30],
+                    (f.href or "")[:50],
+                ]
+            )
+        )
+    return "||".join(parts)
+
+
 def _step_from_session(session_doc: Dict[str, Any], step_number: int) -> Optional[PlannedStep]:
     steps = session_doc.get("planned_steps") or []
     for s in steps:
@@ -110,6 +128,20 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
     if not planned_steps:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Planner returned no steps")
 
+    # Safety net: for Instagram goals from the wrong site, ensure the first manual step includes the URL line
+    # so the frontend can render it as a clickable link.
+    try:
+        if planned_steps and planned_steps[0].action == "WAIT":
+            g = (request.user_goal or "").lower()
+            if "instagram" in g and _domain_from_url(request.url) != "www.instagram.com":
+                url_line = "https://www.instagram.com/accounts/emailsignup/"
+                if url_line not in (planned_steps[0].description or ""):
+                    planned_steps[0].description = (planned_steps[0].description or "").rstrip() + f"\n{url_line}"
+                    planned_steps[0].expected_page_change = True
+    except Exception:
+        # Non-fatal: don't block session creation on string patching.
+        pass
+
     total_steps = len(planned_steps)
     first_step = planned_steps[0]
 
@@ -120,6 +152,8 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
         "domain": _domain_from_url(request.url),
         "planned_domain": _domain_from_url(request.url),
         "url": request.url,
+        "last_seen_url": request.url,
+        "last_seen_sig": _features_signature(request.initial_page_features),
         "planned_steps": [s.model_dump() for s in planned_steps],
         "current_step_number": first_step.step_number,
         "last_sent_step_number": first_step.step_number,
@@ -214,6 +248,21 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
     now = _utcnow()
     current_step_number = int(session_doc.get("current_step_number", 1))
     last_sent = int(session_doc.get("last_sent_step_number", current_step_number))
+    last_seen_url = str(session_doc.get("last_seen_url") or "")
+    last_seen_sig = str(session_doc.get("last_seen_sig") or "")
+
+    # Update seen markers (we still use previous values below for change detection).
+    if request.url:
+        await db.sessions.update_one(
+            {"session_id": request.session_id},
+            {
+                "$set": {
+                    "last_seen_url": request.url,
+                    "last_seen_sig": _features_signature(request.page_features),
+                    "updated_at": now,
+                }
+            },
+        )
 
     # Re-plan if the user navigated to a different domain (manual URL bar / new tab),
     # so we can generate steps based on the *new* DOM.
@@ -354,6 +403,75 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Gemini matcher error: {e}"
                 ) from e
+
+        # Adaptive behavior: if we can't match the current step to the current DOM,
+        # and the page/DOM has changed since we last saw it, re-plan from the current page.
+        if not match.get("matched", False) and request.url:
+            curr_sig = _features_signature(request.page_features)
+            url_changed = bool(last_seen_url and request.url and request.url != last_seen_url)
+            sig_changed = bool(last_seen_sig and curr_sig and curr_sig != last_seen_sig)
+            if url_changed or sig_changed:
+                try:
+                    new_steps = await generate_workflow_plan(
+                        user_goal=session_doc.get("user_goal", ""),
+                        initial_features=request.page_features,
+                        url=request.url,
+                        page_title=request.page_title or "",
+                    )
+                except PlannerError as e:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Planner error (replan): {e}"
+                    ) from e
+
+                if new_steps:
+                    await db.sessions.update_one(
+                        {"session_id": request.session_id},
+                        {
+                            "$set": {
+                                "planned_steps": [s.model_dump() for s in new_steps],
+                                "current_step_number": new_steps[0].step_number,
+                                "last_sent_step_number": new_steps[0].step_number,
+                                "updated_at": now,
+                                "url": request.url,
+                                "domain": _domain_from_url(request.url),
+                                "planned_domain": _domain_from_url(request.url),
+                            }
+                        },
+                    )
+
+                    step = new_steps[0]
+                    if step.action in {"SCROLL", "WAIT"}:
+                        match = {"matched": True, "feature_index": None, "confidence": 1.0, "feature": None}
+                    elif step.action == "DONE":
+                        return NextActionResponse(
+                            step_number=step.step_number,
+                            total_steps=len(new_steps),
+                            action="DONE",
+                            target_feature_index=None,
+                            target_feature=None,
+                            instruction=step.description or "Done.",
+                            text_input=None,
+                            confidence=1.0,
+                            expected_page_change=step.expected_page_change,
+                            session_complete=True,
+                        )
+                    else:
+                        match = match_element_to_step(step, request.page_features)
+                        if not match["matched"]:
+                            match = await fallback_to_gemini(step, request.page_features)
+
+                    return NextActionResponse(
+                        step_number=step.step_number,
+                        total_steps=len(new_steps),
+                        action=step.action,
+                        target_feature_index=match["feature_index"],
+                        target_feature=match["feature"],
+                        instruction=_instruction_for_step(step),
+                        text_input=step.text_input,
+                        confidence=float(match["confidence"]),
+                        expected_page_change=step.expected_page_change,
+                        session_complete=False,
+                    )
 
     # Log suggestion
     try:
