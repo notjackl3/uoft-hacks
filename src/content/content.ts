@@ -48,10 +48,46 @@ async function handleUserPrompt(prompt: string): Promise<{ message: string; domS
 
   console.log('DOM Statistics:', domStats);
 
-  // Build response message
+  // Get first 10 links
+  const allLinks = Array.from(document.querySelectorAll('a'));
+  const first10Links = allLinks.slice(0, 10);
+  
+  console.log('First 10 links:');
+  const linksInfo = first10Links.map((link, index) => {
+    const href = link.getAttribute('href') || 'No href';
+    const text = link.innerText.trim() || link.textContent?.trim() || 'No text';
+    console.log(`${index + 1}. [${text.substring(0, 50)}] -> ${href}`);
+    return { index: index + 1, text: text.substring(0, 50), href };
+  });
+
+  // Click a random link from the first 10
+  let clickedLink = null;
+  if (first10Links.length > 0) {
+    const randomIndex = Math.floor(Math.random() * first10Links.length);
+    const randomLink = first10Links[randomIndex] as HTMLElement;
+    clickedLink = {
+      index: randomIndex + 1,
+      text: randomLink.innerText.trim() || randomLink.textContent?.trim() || 'No text',
+      href: randomLink.getAttribute('href') || 'No href'
+    };
+    
+    console.log(`Clicking random link #${clickedLink.index}: ${clickedLink.text}`);
+    randomLink.click();
+  }
+
+  // Build response message with links
+  let linksMessage = '\n\n**First 10 Links Found:**\n';
+  linksInfo.forEach(link => {
+    linksMessage += `${link.index}. ${link.text} → ${link.href}\n`;
+  });
+
+  const clickMessage = clickedLink 
+    ? `\n\n**🎲 Clicked Random Link #${clickedLink.index}:** ${clickedLink.text}`
+    : '\n\n⚠️ No links found to click';
+
   const message = `
- **Page Inspected**: ${pageTitle}
- **URL**: ${pageUrl}
+📄 **Page Inspected**: ${pageTitle}
+🔗 **URL**: ${pageUrl}
 
 **DOM Statistics**:
 - Total Elements: ${domStats.totalElements}
@@ -59,10 +95,9 @@ async function handleUserPrompt(prompt: string): Promise<{ message: string; domS
 - Images: ${domStats.images}
 - Buttons: ${domStats.buttons}
 - Input Fields: ${domStats.inputs}
+${linksMessage}${clickMessage}
 
 **Your Prompt**: "${prompt}"
-
-I have access to the DOM and can interact with this page. Ready for LLM integration!
   `.trim();
 
   return {
