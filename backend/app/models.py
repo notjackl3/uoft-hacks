@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class PageFeature(BaseModel):
@@ -22,6 +22,19 @@ class TargetHints(BaseModel):
     placeholder_contains: List[str] = Field(default_factory=list)
     selector_pattern: Optional[str] = None
     role: Optional[str] = None
+
+    @field_validator("text_contains", "placeholder_contains", mode="before")
+    @classmethod
+    def _coerce_list_fields(cls, v):
+        # LLMs sometimes output null for list fields; treat that as empty list.
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [str(x) for x in v if x is not None and str(x).strip()]
+        if isinstance(v, str):
+            return [v] if v.strip() else []
+        # Fallback: unknown type -> empty
+        return []
 
 
 class PlannedStep(BaseModel):
@@ -55,6 +68,8 @@ class PreviousActionResult(BaseModel):
 class NextActionRequest(BaseModel):
     session_id: str
     page_features: List[PageFeature]
+    url: Optional[str] = None
+    page_title: Optional[str] = None
     previous_action_result: PreviousActionResult = Field(default_factory=PreviousActionResult)
 
 

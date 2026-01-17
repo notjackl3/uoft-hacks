@@ -45,6 +45,9 @@ def _domain_from_url(url: str) -> str:
     except Exception:
         return ""
 
+def _same_domain(a: str, b: str) -> bool:
+    return _domain_from_url(a) != "" and _domain_from_url(a) == _domain_from_url(b)
+
 
 def _step_from_session(session_doc: Dict[str, Any], step_number: int) -> Optional[PlannedStep]:
     steps = session_doc.get("planned_steps") or []
@@ -99,9 +102,10 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
             user_goal=request.user_goal,
             initial_features=request.initial_page_features,
             url=request.url,
+            page_title=request.page_title,
         )
     except PlannerError as e:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Gemini planner error: {e}") from e
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Planner error: {e}") from e
 
     if not planned_steps:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Planner returned no steps")
@@ -114,6 +118,7 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
         "user_goal": request.user_goal,
         "goal_embedding": goal_embedding,
         "domain": _domain_from_url(request.url),
+        "planned_domain": _domain_from_url(request.url),
         "url": request.url,
         "planned_steps": [s.model_dump() for s in planned_steps],
         "current_step_number": first_step.step_number,
@@ -209,6 +214,79 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
     now = _utcnow()
     current_step_number = int(session_doc.get("current_step_number", 1))
     last_sent = int(session_doc.get("last_sent_step_number", current_step_number))
+
+    # Re-plan if the user navigated to a different domain (manual URL bar / new tab),
+    # so we can generate steps based on the *new* DOM.
+    if request.previous_action_result.success and request.url:
+        planned_domain = session_doc.get("planned_domain") or session_doc.get("domain") or ""
+        current_domain = _domain_from_url(request.url)
+        if current_domain and current_domain != planned_domain:
+            try:
+                new_steps = await generate_workflow_plan(
+                    user_goal=session_doc.get("user_goal", ""),
+                    initial_features=request.page_features,
+                    url=request.url,
+                    page_title=request.page_title or "",
+                )
+            except PlannerError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Planner error (replan): {e}"
+                ) from e
+
+            if not new_steps:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Planner returned no steps (replan)"
+                )
+
+            await db.sessions.update_one(
+                {"session_id": request.session_id},
+                {
+                    "$set": {
+                        "planned_steps": [s.model_dump() for s in new_steps],
+                        "current_step_number": new_steps[0].step_number,
+                        "last_sent_step_number": new_steps[0].step_number,
+                        "updated_at": now,
+                        "url": request.url,
+                        "domain": current_domain,
+                        "planned_domain": current_domain,
+                        "status": "in_progress",
+                    }
+                },
+            )
+
+            step = new_steps[0]
+            if step.action in {"SCROLL", "WAIT"}:
+                match = {"matched": True, "feature_index": None, "confidence": 1.0, "feature": None}
+            elif step.action == "DONE":
+                return NextActionResponse(
+                    step_number=step.step_number,
+                    total_steps=len(new_steps),
+                    action="DONE",
+                    target_feature_index=None,
+                    target_feature=None,
+                    instruction=step.description or "Done.",
+                    text_input=None,
+                    confidence=1.0,
+                    expected_page_change=step.expected_page_change,
+                    session_complete=True,
+                )
+            else:
+                match = match_element_to_step(step, request.page_features)
+                if not match["matched"]:
+                    match = await fallback_to_gemini(step, request.page_features)
+
+            return NextActionResponse(
+                step_number=step.step_number,
+                total_steps=len(new_steps),
+                action=step.action,
+                target_feature_index=match["feature_index"],
+                target_feature=match["feature"],
+                instruction=_instruction_for_step(step),
+                text_input=step.text_input,
+                confidence=float(match["confidence"]),
+                expected_page_change=step.expected_page_change,
+                session_complete=False,
+            )
 
     # Only advance if the client reports success for the last action we sent.
     if request.previous_action_result.success and last_sent == current_step_number:

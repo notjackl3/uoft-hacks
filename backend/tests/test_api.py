@@ -14,7 +14,7 @@ async def test_session_flow_start_next_correct_status(fake_db, monkeypatch):
     async def _embed_text(_text: str):
         return [0.0] * 8
 
-    async def _generate_workflow_plan(user_goal, initial_features, url):
+    async def _generate_workflow_plan(user_goal, initial_features, url, page_title=""):
         return [
             PlannedStep(
                 step_number=1,

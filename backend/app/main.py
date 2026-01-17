@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import close_mongo_connection, connect_to_mongo
 from app.routes import session
+from app.utils.rate_limiter import get_rate_limit_status
 
 
 def create_app(with_db: bool = True) -> FastAPI:
@@ -39,8 +40,12 @@ def create_app(with_db: bool = True) -> FastAPI:
     async def health_check():
         return {"status": "healthy"}
 
+    @app.get("/debug/rate-limit")
+    async def rate_limit_status():
+        """Check current rate limit status for Gemini API calls."""
+        return get_rate_limit_status()
+
     return app
 
 
 app = create_app(with_db=True)
-

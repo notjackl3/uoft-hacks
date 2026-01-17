@@ -16,8 +16,8 @@ def test_build_planner_prompt_includes_goal_url_and_features():
     )
     assert "buy wireless mouse under $30" in prompt
     assert "https://amazon.com" in prompt
-    assert "index=0" in prompt
-    assert "selector=#search" in prompt
+    assert '"index": 0' in prompt
+    assert '"selector": "#search"' in prompt
 
 
 def test_parse_planner_steps_valid_json():
