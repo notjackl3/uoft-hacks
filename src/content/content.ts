@@ -138,10 +138,36 @@ function extractPageFeatures(): ContentResponse {
   const features: PageFeature[] = [];
   let index = 0;
 
+  // Smart context detection based on URL
+  const url = pageUrl.toLowerCase();
+  let limits = {
+    nav: 20,
+    products: 60,
+    inputs: 30,
+    buttons: 20
+  };
+
+  // Adjust limits based on page type
+  if (url.includes('/product') || url.includes('/item') || url.includes('/collections') || 
+      url.includes('/shop') || url.includes('/category') || url.includes('/search')) {
+    // Product listing/detail pages - prioritize product links
+    limits = { nav: 15, products: 70, inputs: 10, buttons: 15 };
+  } else if (url.includes('/cart') || url.includes('/bag') || url.includes('/basket')) {
+    // Cart page - prioritize buttons and inputs
+    limits = { nav: 10, products: 20, inputs: 30, buttons: 40 };
+  } else if (url.includes('/checkout') || url.includes('/payment') || url.includes('/shipping')) {
+    // Checkout page - prioritize inputs and buttons
+    limits = { nav: 5, products: 5, inputs: 50, buttons: 40 };
+  } else if (url.includes('/account') || url.includes('/profile') || url.includes('/login') || url.includes('/signup')) {
+    // Account/auth pages - prioritize inputs and buttons
+    limits = { nav: 10, products: 10, inputs: 50, buttons: 30 };
+  }
+
+  console.log(`📊 Context: Using limits - nav:${limits.nav}, products:${limits.products}, inputs:${limits.inputs}, buttons:${limits.buttons}`);
+
   // Collect navigation links first (including those in collapsed menus/dropdowns)
-  // These are critical for site navigation even if temporarily hidden
   const navLinks = Array.from(document.querySelectorAll('header a[href], nav a[href], [role="navigation"] a[href], .header a[href], .nav a[href]'));
-  navLinks.slice(0, 100).forEach((link) => {
+  navLinks.slice(0, limits.nav).forEach((link) => {
     const el = link as HTMLAnchorElement;
     // For navigation, use a relaxed visibility check - just ensure it's not permanently hidden
     const style = window.getComputedStyle(el);
@@ -168,7 +194,7 @@ function extractPageFeatures(): ContentResponse {
 
   // Collect inputs (usually most important for forms)
   const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="button"]):not([type="submit"]), textarea, select'));
-  inputs.slice(0, 20).forEach((input) => {
+  inputs.slice(0, limits.inputs).forEach((input) => {
     const el = input as HTMLInputElement;
     if (!isVisible(el)) return;
     
@@ -192,7 +218,7 @@ function extractPageFeatures(): ContentResponse {
 
   // Collect buttons
   const buttons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]'));
-  buttons.slice(0, 20).forEach((button) => {
+  buttons.slice(0, limits.buttons).forEach((button) => {
     const el = button as HTMLElement;
     if (!isVisible(el)) return;
     
@@ -211,9 +237,15 @@ function extractPageFeatures(): ContentResponse {
     });
   });
 
-  // Collect other links (non-navigation)
-  const links = Array.from(document.querySelectorAll('a[href]'));
-  links.slice(0, 20).forEach((link) => {
+  // Collect other links (non-navigation) - PRIORITIZE PRODUCT CARDS
+  // Look for product cards, images with links, article links, etc.
+  const links = Array.from(document.querySelectorAll(
+    'a[href]:not(header a):not(nav a), ' +
+    '.product-card a, .product-item a, .product a, ' +
+    '[class*="product"] a, [class*="item"] a, ' +
+    'article a, .card a, [data-product] a'
+  ));
+  links.slice(0, limits.products).forEach((link) => {
     const el = link as HTMLAnchorElement;
     // Skip if already collected as nav link
     if (el.closest('header, nav, [role="navigation"], .header, .nav')) return;
@@ -249,28 +281,8 @@ function extractPageFeatures(): ContentResponse {
     f.index = idx;
   });
 
-  // Debug log: what the agent can "see"
-  try {
-    console.groupCollapsed(
-      `[Big Brother] Extracted ${uniqueFeatures.length} interactive elements`,
-      pageUrl
-    );
-    console.table(
-      uniqueFeatures.map((f) => ({
-        index: f.index,
-        type: f.type,
-        text: f.text,
-        placeholder: f.placeholder || '',
-        aria_label: f.aria_label || '',
-        href: f.href || '',
-        value_len: f.value_len ?? 0,
-        selector: f.selector,
-      }))
-    );
-    console.groupEnd();
-  } catch {
-    console.log(`Extracted ${uniqueFeatures.length} features from page`);
-  }
+  // Simplified logging - only show summary unless explicitly expanded
+  console.log(`[Big Brother] Extracted ${uniqueFeatures.length} interactive elements ${pageUrl}`);
 
   return {
     success: true,

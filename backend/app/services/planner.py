@@ -33,7 +33,7 @@ def build_planner_prompt(user_goal: str, initial_features: list, url: str, page_
             "selector": f.selector or "",
             "already_clicked": getattr(f, "already_clicked", False),
         }
-        for f in initial_features[:30]
+        for f in initial_features[:20]  # Reduced for speed
     ]
     features_json = json.dumps(features, ensure_ascii=False)
 

@@ -18,12 +18,12 @@ BACKBOARD_BASE_URL = "https://app.backboard.io/api"
 
 
 class AIModel(Enum):
-    """Available AI models for different tasks"""
-    GPT4 = ("openai", "gpt-4o")  # Complex planning and reasoning
+    """Available AI models for different tasks (optimized for speed)"""
+    GPT4 = ("openai", "gpt-4o-mini")  # Faster planning with good quality
     GPT35 = ("openai", "gpt-3.5-turbo")  # Fast element matching
-    CLAUDE = ("anthropic", "claude-3-7-sonnet-20250219")  # Code generation (updated)
-    GEMINI = ("google", "gemini-2.5-flash")  # Quick tasks (updated)
-    GROK = ("xai", "grok-4-0709")  # Quick decisions (updated to latest)
+    CLAUDE = ("anthropic", "claude-3-7-sonnet-20250219")  # Code generation
+    GEMINI = ("google", "gemini-2.5-flash-lite")  # Fastest quick tasks
+    GROK = ("xai", "grok-3-mini")  # Faster quick decisions
 
 
 class TaskType(Enum):
@@ -160,7 +160,7 @@ class BackboardAI:
                         "send_to_llm": "true"
                     },
                     headers=self.headers,
-                    timeout=60.0
+                    timeout=30.0
                 )
                 
                 # Log response details for debugging
