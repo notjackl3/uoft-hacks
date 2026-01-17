@@ -1,0 +1,63 @@
+{
+  "user_goal": "buy wireless mouse under $30",
+  "url": "https://www.amazon.com",
+  "page_title": "Amazon.com",
+  "planned_steps": [
+    {
+      "step_number": 1,
+      "action": "CLICK",
+      "description": "Click the search bar",
+      "target_hints": { "type": "input", "text_contains": ["search"], "placeholder_contains": ["search"] },
+      "text_input": null,
+      "expected_page_change": false
+    },
+    {
+      "step_number": 2,
+      "action": "TYPE",
+      "description": "Type 'wireless mouse' in the search field",
+      "target_hints": { "type": "input", "text_contains": ["search"], "placeholder_contains": ["search"] },
+      "text_input": "wireless mouse",
+      "expected_page_change": false
+    },
+    {
+      "step_number": 3,
+      "action": "CLICK",
+      "description": "Click the search submit button",
+      "target_hints": { "type": "button", "text_contains": ["go", "search"] },
+      "text_input": null,
+      "expected_page_change": true
+    },
+    {
+      "step_number": 4,
+      "action": "DONE",
+      "description": "Done",
+      "target_hints": {},
+      "text_input": null,
+      "expected_page_change": false
+    }
+  ],
+  "stages": [
+    {
+      "stage": 1,
+      "page_features": [
+        { "index": 0, "type": "input", "text": "", "selector": "#twotabsearchtextbox", "placeholder": "Search Amazon", "aria_label": "Search Amazon" },
+        { "index": 1, "type": "button", "text": "Go", "selector": "#nav-search-submit-button", "aria_label": "Go" }
+      ]
+    },
+    {
+      "stage": 2,
+      "page_features": [
+        { "index": 0, "type": "input", "text": "", "selector": "#twotabsearchtextbox", "placeholder": "Search Amazon", "aria_label": "Search Amazon" },
+        { "index": 1, "type": "button", "text": "Go", "selector": "#nav-search-submit-button", "aria_label": "Go" }
+      ]
+    },
+    {
+      "stage": 3,
+      "page_features": [
+        { "index": 0, "type": "input", "text": "", "selector": "#twotabsearchtextbox", "placeholder": "Search Amazon", "aria_label": "Search Amazon" },
+        { "index": 1, "type": "button", "text": "Go", "selector": "#nav-search-submit-button", "aria_label": "Go" }
+      ]
+    }
+  ]
+}
+
