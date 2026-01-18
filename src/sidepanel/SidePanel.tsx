@@ -2,6 +2,9 @@ import React, { useState, useEffect, useRef } from 'react';
 import { sendMessageToContent } from '../utils/messaging';
 import { startSession, getNextAction, type PlannedStep, type PageFeature, ApiError } from '../utils/api';
 import type { Message, AgentStatus, ContentResponse } from '../types/messages';
+import HealthySnacks from './HealthySnacks';
+
+type TabType = 'assistant' | 'snacks';
 
 interface SessionState {
   sessionId: string | null;
@@ -22,6 +25,7 @@ declare global {
 }
 
 const SidePanel: React.FC = () => {
+  const [activeTab, setActiveTab] = useState<TabType>('assistant');
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputValue, setInputValue] = useState('');
   const [status, setStatus] = useState<AgentStatus>('idle');
@@ -1095,8 +1099,168 @@ const SidePanel: React.FC = () => {
     });
   };
 
+  // Handle buying a product from the snacks tab
+  const handleBuyProduct = async (product: { title: string; vendor?: string; price: number; url?: string }) => {
+    // Switch to assistant tab
+    setActiveTab('assistant');
+    
+    // Clear previous session
+    setSession(null);
+    chrome.storage.local.remove(['sessionState']);
+    
+    // Add message explaining what we're doing
+    addAgentMessage(
+      `🛒 **Starting autonomous purchase flow**\n\n` +
+      `Product: **${product.title}**\n` +
+      `Price: $${product.price}\n\n` +
+      `Navigating to the store...`
+    );
+    
+    // Step 1: Navigate to the product/store URL
+    const storeUrl = product.url || `https://www.amazon.ca/s?k=${encodeURIComponent(product.title)}`;
+    
+    try {
+      // Get the active tab and navigate
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (activeTab?.id) {
+        await chrome.tabs.update(activeTab.id, { url: storeUrl });
+        
+        // Wait for page to load
+        addAgentMessage(`📍 Navigating to: ${new URL(storeUrl).hostname}...`);
+        
+        // Wait 3 seconds for page load, then start the assistant
+        setTimeout(() => {
+          const buyGoal = `Find "${product.title}" on this page and add it to cart. The product should be around $${product.price}.`;
+          setInputValue(buyGoal);
+          
+          addAgentMessage('🔍 Page loaded! Now searching for the product...');
+          
+          // Trigger the buy flow
+          setTimeout(() => {
+            handleBuyGoal(buyGoal);
+          }, 500);
+        }, 3000);
+      }
+    } catch (error) {
+      console.error('Navigation error:', error);
+      addAgentMessage(`❌ Could not navigate to store. Please go to ${storeUrl} manually.`);
+    }
+  };
+
+  const handleBuyGoal = async (buyGoal: string) => {
+    addUserMessage(buyGoal);
+    setInputValue('');
+    setStatus('thinking');
+
+    try {
+      // Step 1: Get page features from content script
+      addAgentMessage('🔍 Scanning the page for interactive elements...');
+      
+      const contentResponse: ContentResponse = await sendMessageToContent({
+        type: 'GET_FEATURES',
+      });
+
+      if (!contentResponse.success || !contentResponse.features) {
+        throw new Error(contentResponse.error || 'Failed to get page features');
+      }
+
+      const { features, pageUrl, pageTitle } = contentResponse;
+      
+      addAgentMessage(`📋 Found **${features.length}** interactive elements on this page.`);
+
+      // Step 2: Send to backend to generate workflow
+      addAgentMessage('🤖 Planning the purchase steps...');
+      setStatus('acting');
+
+      const sessionResponse = await startSession({
+        user_goal: buyGoal,
+        initial_page_features: features as PageFeature[],
+        url: pageUrl || window.location.href,
+        page_title: pageTitle || 'Unknown Page',
+      });
+
+      // Store session state - awaiting confirmation
+      setSession({
+        sessionId: sessionResponse.session_id,
+        plannedSteps: sessionResponse.planned_steps,
+        currentStepIndex: 0,
+        totalSteps: sessionResponse.total_steps,
+        awaitingConfirmation: true,
+        isExecuting: false,
+      });
+
+      // Display the generated plan
+      const stepsMessage = formatPlannedSteps(sessionResponse.planned_steps);
+      addAgentMessage(
+        `📝 **Here's my plan to buy this for you:**\n\n` +
+        `${stepsMessage}\n\n` +
+        `---\n` +
+        `**Total steps: ${sessionResponse.total_steps}**`
+      );
+
+      // Ask for confirmation
+      addAgentMessage('👆 **Type Y to proceed with the purchase, or N to cancel.**');
+
+      setStatus('idle');
+    } catch (error) {
+      console.error('Error:', error);
+      
+      let errorMessage = 'Something went wrong.';
+      if (error instanceof ApiError) {
+        errorMessage = `API Error: ${error.message}`;
+      } else if (error instanceof Error) {
+        errorMessage = `Error: ${error.message}`;
+      }
+
+      addAgentMessage(errorMessage);
+      setStatus('idle');
+    }
+  };
+
+  // If snacks tab is active, render the HealthySnacks component
+  if (activeTab === 'snacks') {
+    return (
+      <div className="flex flex-col h-screen bg-gray-50">
+        {/* Tab Bar */}
+        <div className="bg-white border-b flex">
+          <button
+            onClick={() => setActiveTab('assistant')}
+            className="flex-1 py-3 text-sm font-medium text-gray-500 hover:text-gray-700 hover:bg-gray-50 transition-colors border-b-2 border-transparent"
+          >
+            🤖 Assistant
+          </button>
+          <button
+            onClick={() => setActiveTab('snacks')}
+            className="flex-1 py-3 text-sm font-medium text-green-600 border-b-2 border-green-600 bg-green-50"
+          >
+            🥗 Healthy Snacks
+          </button>
+        </div>
+        <div className="flex-1 overflow-hidden">
+          <HealthySnacks onBuyProduct={handleBuyProduct} />
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col h-screen bg-gray-50">
+      {/* Tab Bar */}
+      <div className="bg-white border-b flex">
+        <button
+          onClick={() => setActiveTab('assistant')}
+          className="flex-1 py-3 text-sm font-medium text-blue-600 border-b-2 border-blue-600 bg-blue-50"
+        >
+          🤖 Assistant
+        </button>
+        <button
+          onClick={() => setActiveTab('snacks')}
+          className="flex-1 py-3 text-sm font-medium text-gray-500 hover:text-gray-700 hover:bg-gray-50 transition-colors border-b-2 border-transparent"
+        >
+          🥗 Healthy Snacks
+        </button>
+      </div>
+
       {/* Microphone Instructions Banner */}
       {showMicInstructions && (
         <div className="bg-orange-500 text-white px-4 py-4 border-b-2 border-orange-600">

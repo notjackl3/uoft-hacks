@@ -5,6 +5,7 @@
   "description": "An AI Agent interface for inspecting and interacting with webpages",
   "permissions": [
     "activeTab",
+    "tabs",
     "scripting",
     "storage",
     "sidePanel"

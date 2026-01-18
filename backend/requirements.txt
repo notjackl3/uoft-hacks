@@ -10,6 +10,15 @@ voyageai
 python-multipart==0.0.6
 backboard-sdk  # Backboard.io unified AI API
 
+# Neo4j
+neo4j==5.15.0
+
+# Document Processing
+beautifulsoup4==4.12.2
+requests==2.31.0
+PyPDF2==3.0.1
+tiktoken==0.5.2
+
 # Testing
 pytest==7.4.3
 pytest-asyncio==0.21.1

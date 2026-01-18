@@ -32,6 +32,11 @@ if BaseSettings is not None:
         environment: str = "development"
         log_level: str = "INFO"
         
+        # Neo4j settings
+        neo4j_uri: str = "bolt://localhost:7687"
+        neo4j_user: str = "neo4j"
+        neo4j_password: str = "password"
+        
         # Rate limiting settings
         llm_min_delay: float = 1.0   # Min seconds between LLM calls
         llm_max_retries: int = 3     # Max retries on rate limit
@@ -51,6 +56,11 @@ else:
             self.backboard_api_key = os.getenv("BACKBOARD_API_KEY", "")  # Backboard.io unified API
             self.environment = os.getenv("ENVIRONMENT", "development")
             self.log_level = os.getenv("LOG_LEVEL", "INFO")
+            
+            # Neo4j settings
+            self.neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+            self.neo4j_user = os.getenv("NEO4J_USER", "neo4j")
+            self.neo4j_password = os.getenv("NEO4J_PASSWORD", "password")
             
             # Rate limiting settings
             self.llm_min_delay = float(os.getenv("LLM_MIN_DELAY", "1.0"))
