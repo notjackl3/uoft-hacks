@@ -6,13 +6,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.database import close_mongo_connection, connect_to_mongo
+from app.database import close_mongo_connection, connect_to_mongo, get_db
 from app.routes import session
 from app.routes.companies import router as companies_router
 from app.routes.commerce import router as commerce_router
+from app.routes import cache as cache_routes
 from app.utils.rate_limiter import get_rate_limit_status
 from app.services.backboard_ai import backboard_ai
 from app.services.graph import graph_service
+from app.services.cache_service import ensure_cache_indexes
 
 
 def create_app(with_db: bool = True) -> FastAPI:
@@ -40,6 +42,12 @@ def create_app(with_db: bool = True) -> FastAPI:
                     graph_service.setup_vector_index()
             except Exception as e:
                 logging.warning(f"Neo4j setup skipped: {e}")
+            # Initialize cache indexes
+            try:
+                db = get_db()
+                await ensure_cache_indexes(db)
+            except Exception as e:
+                logging.warning(f"Failed to initialize cache indexes (non-fatal): {e}")
 
         @app.on_event("shutdown")
         async def shutdown_event():
@@ -49,6 +57,7 @@ def create_app(with_db: bool = True) -> FastAPI:
     app.include_router(session.router, prefix="/api/session", tags=["session"])
     app.include_router(companies_router, prefix="/api/companies", tags=["companies"])
     app.include_router(commerce_router, prefix="/api/commerce", tags=["commerce"])
+    app.include_router(cache_routes.router, prefix="/api", tags=["cache"])
 
     @app.get("/health")
     async def health_check():

@@ -32,6 +32,13 @@ from app.services.matcher import MatcherError, fallback_to_gemini, match_element
 from app.services.planner import PlannerError, generate_workflow_plan
 from app.services.goal_normalizer import infer_target_from_goal, normalize_goal_llm
 from app.services.step_selector import select_next_step
+from app.services.cache_service import (
+    lookup_exact_match,
+    lookup_cached_plan,
+    save_plan_to_cache,
+    record_cache_usage,
+    record_cache_correction,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -235,26 +242,83 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
             },
         )
 
-    try:
-        goal_embedding = await embed_text(request.user_goal)
-    except EmbeddingsError as e:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Voyage AI error: {e}") from e
-
     # Single-step selector mode: generate only the first step for the current page.
     canonical_goal = getattr(norm, "canonical_goal", None) or request.user_goal
-    try:
-        first_step = await select_next_step(
-            step_number=1,
-            canonical_goal=canonical_goal,
-            url=request.url,
-            page_title=request.page_title,
-            page_features=request.initial_page_features,
-            recent_steps=None,
+    
+    cache_id: Optional[str] = None
+    cache_match_method: Optional[str] = None
+    cache_confidence: float = 0.0
+    goal_embedding: List[float] = []
+    planned_steps: List[PlannedStep] = []
+    
+    # STEP 1: Try EXACT MATCH first - this is instant (no API calls)
+    cache_result = await lookup_exact_match(
+        db=db,
+        canonical_goal=canonical_goal,
+        user_goal=request.user_goal,  # Also try matching on raw prompt
+    )
+    
+    if cache_result["hit"]:
+        # INSTANT cache hit! No API calls needed at all
+        cached_plan = cache_result["cached_plan"]
+        planned_steps = [PlannedStep.model_validate(s) for s in cached_plan["planned_steps"]]
+        
+        cache_id = cache_result["cache_id"]
+        cache_match_method = cache_result["match_method"]
+        cache_confidence = cache_result["confidence"]
+        
+        # Use cached embedding if available (for session storage)
+        goal_embedding = cached_plan.get("goal_embedding", [])
+        
+        logger.info(
+            f"Cache EXACT HIT (instant, 0 API calls): {cache_id} "
+            f"steps={len(planned_steps)}"
         )
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Step selector error: {e}") from e
+    else:
+        # STEP 2: No exact match - generate embedding for fuzzy matching
+        try:
+            goal_embedding = await embed_text(request.user_goal)
+        except EmbeddingsError as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Voyage AI error: {e}") from e
+        
+        # Try keyword + semantic matching
+        cache_result = await lookup_cached_plan(
+            db=db,
+            user_goal=request.user_goal,
+            canonical_goal=canonical_goal,
+            target_domain=norm.target_domain,
+            goal_embedding=goal_embedding,
+        )
+        
+        if cache_result["hit"]:
+            # Fuzzy cache hit (keyword or semantic)
+            cached_plan = cache_result["cached_plan"]
+            planned_steps = [PlannedStep.model_validate(s) for s in cached_plan["planned_steps"]]
+            
+            cache_id = cache_result["cache_id"]
+            cache_match_method = cache_result["match_method"]
+            cache_confidence = cache_result["confidence"]
+            
+            logger.info(
+                f"Cache HIT ({cache_match_method}): {cache_id} "
+                f"confidence={cache_confidence:.2f} steps={len(planned_steps)}"
+            )
+        else:
+            # STEP 3: No cache hit at all - generate new plan via LLM
+            try:
+                first_step = await select_next_step(
+                    step_number=1,
+                    canonical_goal=canonical_goal,
+                    url=request.url,
+                    page_title=request.page_title,
+                    page_features=request.initial_page_features,
+                    recent_steps=None,
+                )
+            except Exception as e:
+                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Step selector error: {e}") from e
 
-    planned_steps = [first_step]
+            planned_steps = [first_step]
+            logger.info("Cache MISS - generated new plan via LLM")
 
     # Safety net: for Instagram goals from the wrong site, ensure the first manual step includes the URL line
     # so the frontend can render it as a clickable link.
@@ -272,7 +336,7 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
 
     total_steps = len(planned_steps)
     first_step = planned_steps[0]
-
+    
     session_doc = {
         "session_id": session_id,
         "user_goal": request.user_goal,
@@ -285,13 +349,17 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
         "url": request.url,
         "last_seen_url": request.url,
         "last_seen_sig": _features_signature(request.initial_page_features),
-        "mode": "single_step",
+        "mode": "single_step" if not cache_id else "cached",  # Track if using cache
         "planned_steps": [s.model_dump() for s in planned_steps],
         "current_step_number": first_step.step_number,
         "last_sent_step_number": first_step.step_number,
         "status": "in_progress",
         "created_at": now,
         "updated_at": now,
+        # Cache tracking fields
+        "cache_id": cache_id,
+        "cache_match_method": cache_match_method,
+        "cache_confidence": cache_confidence,
     }
 
     # Try to persist session, but continue even if MongoDB fails
@@ -514,6 +582,31 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
             "current_step_number": current_step_number,
             "last_sent_step_number": current_step_number,
         })
+        
+        # Handle cache: record usage or save new plan
+        cache_id = session_doc.get("cache_id")
+        if cache_id:
+            # Record successful cache usage
+            await record_cache_usage(db, cache_id, success=True, session_id=request.session_id)
+            logger.info(f"Recorded successful cache usage: {cache_id}")
+        else:
+            # Save this successful plan to cache for future reuse
+            try:
+                new_cache_id = await save_plan_to_cache(
+                    db=db,
+                    session_id=request.session_id,
+                    user_goal=session_doc.get("user_goal", ""),
+                    canonical_goal=session_doc.get("canonical_goal", ""),
+                    planned_steps=[PlannedStep.model_validate(s) for s in session_doc.get("planned_steps", [])],
+                    target_domain=session_doc.get("target_domain"),
+                    target_url=session_doc.get("target_url"),
+                    goal_embedding=session_doc.get("goal_embedding"),
+                )
+                if new_cache_id:
+                    logger.info(f"Saved successful plan to cache: {new_cache_id}")
+            except Exception as e:
+                logger.warning(f"Failed to save plan to cache (non-fatal): {e}")
+        
         return NextActionResponse(
             step_number=current_step_number,
             total_steps=total_steps,
@@ -692,6 +785,23 @@ async def handle_correction(request: CorrectionRequest, db: AsyncIOMotorDatabase
             {"_id": log_entry["_id"]},
             {"$set": {"user_feedback": "wrong_element", "actual_feature_clicked": actual.model_dump()}},
         )
+        
+        # Also record correction for cache if this session used a cached plan
+        cache_id = session_doc.get("cache_id")
+        if cache_id:
+            try:
+                await record_cache_correction(
+                    db=db,
+                    cache_id=cache_id,
+                    step_number=step_number,
+                    correction={
+                        "feedback": request.feedback,
+                        "actual_feature_index": request.actual_feature_index,
+                        "session_id": request.session_id,
+                    },
+                )
+            except Exception as e:
+                logger.warning(f"Failed to record cache correction (non-fatal): {e}")
 
         return {"ok": True, "step_number": step_number, "updated_target_hints": updated_hints.model_dump()}
 
@@ -711,6 +821,25 @@ async def handle_correction(request: CorrectionRequest, db: AsyncIOMotorDatabase
             "timestamp": now,
         }
     )
+    
+    # Also record correction for cache if this session used a cached plan
+    cache_id = session_doc.get("cache_id")
+    if cache_id:
+        try:
+            await record_cache_correction(
+                db=db,
+                cache_id=cache_id,
+                step_number=step_number,
+                correction={
+                    "feedback": request.feedback,
+                    "session_id": request.session_id,
+                },
+            )
+            # Record as a failure for cache metrics
+            await record_cache_usage(db, cache_id, success=False, session_id=request.session_id)
+        except Exception as e:
+            logger.warning(f"Failed to record cache correction/failure (non-fatal): {e}")
+    
     return {"ok": True, "step_number": step_number, "message": "Feedback recorded"}
 
 

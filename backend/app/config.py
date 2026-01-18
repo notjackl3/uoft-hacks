@@ -28,7 +28,7 @@ if BaseSettings is not None:
         mongodb_db_name: str
         openai_api_key: str  # Changed from gemini_api_key
         voyage_api_key: str
-        backboard_api_key: str  # Backboard.io unified API
+        backboard_api_key: str = ""  # Backboard.io unified API (optional)
         environment: str = "development"
         log_level: str = "INFO"
         
