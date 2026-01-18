@@ -27,8 +27,13 @@ mongodb = MongoDB()
 async def connect_to_mongo() -> None:
     # Import lazily to keep imports test-friendly when motor isn't installed.
     from motor.motor_asyncio import AsyncIOMotorClient as _AsyncIOMotorClient  # type: ignore
+    import certifi
 
-    mongodb.client = _AsyncIOMotorClient(settings.mongodb_uri)
+    # Use certifi for SSL certificate verification on macOS
+    mongodb.client = _AsyncIOMotorClient(
+        settings.mongodb_uri,
+        tlsCAFile=certifi.where()
+    )
     mongodb.db = mongodb.client[settings.mongodb_db_name]
 
     # Indexes - commented out due to SSL handshake issues with MongoDB Atlas
