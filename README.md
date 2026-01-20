@@ -2,7 +2,13 @@
 
 A Manifest V3 Chrome Extension that acts as an AI Agent interface, allowing users to interact with webpages through natural language prompts.
 
+**Devpost:** [Devpost](https://devpost.com/software/big-bro-tsv0i9)
+
 **Landing Page:** [GitHub](https://github.com/phintruong/Big-Bro-UoftHack) | [Live Site](https://big-bro-please-help-me-with-this-new.tech/)
+
+**Catagories won** 
+Runner Up - Backboard.io: Memory Lane: Adaptive AI Journeys
+Winner: MLH: Best .Tech Domain Name
 
 ## :rocket: Tech Stack
 
